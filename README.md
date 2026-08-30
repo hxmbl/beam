@@ -1,8 +1,12 @@
 # Beam
 
+**Work in Progress - Prototype Stage**
+
 Beam streams missing binaries from your client to a remote server over an existing SSH connection.
 
-## How It Works
+> **Important**: This is currently a prototype implementation. The core protocol and components exist, but the end-to-end SSH integration and user approval flow are incomplete. See "Current Status" below for details.
+
+## How It Works (Intended Design)
 
 1. **Client side**: When you run `ssh server`, a shell wrapper starts `beam-client` which:
    - Generates a unique session ID
@@ -17,49 +21,57 @@ Beam streams missing binaries from your client to a remote server over an existi
    - Connects to `localhost:BEAM_LISTENER_PORT` (tunneled to client's `beam-client`)
    - Requests the binary with command name, args, architecture, OS
    - Client checks if binary exists and is compatible
-   - Client prompts user for approval
+   - Client prompts user for approval *(not yet implemented)*
    - If approved, client streams binary with BLAKE3 verification
    - Server executes binary with original arguments, preserving stdin/stdout/stderr/exit code
 
-## Installation
+## Current Status
 
-### Client (your machine)
+### Implemented
+- **Workspace structure**: Clean separation into `beam-client`, `beam-server`, `beam-common`
+- **Protocol design**: JSON Lines protocol with magic bytes and version negotiation
+- **Client binary discovery**: Finds binaries in PATH and allowed paths
+- **Binary metadata**: Size and BLAKE3 hash computation
+- **Architecture/OS detection**: Basic compatibility checking
+- **Binary streaming**: Chunked binary transfer with BLAKE3 verification
+- **Server binary execution**: Temp file creation, execution, cleanup
+- **Shell integration scripts**: Bash/zsh/fish wrapper scripts (skeletal)
+- **Tests**: Unit tests for protocol, integration tests for handshake and streaming
+
+### Incomplete/Prototype
+- **User approval flow**: Approval message is created but not sent over the connection
+- **SSH reverse port forwarding**: Basic implementation exists but not tested end-to-end
+- **Shell integration**: Scripts exist but not integrated with actual SSH workflow
+- **Error handling**: Basic error handling exists but needs refinement
+- **Session management**: Session tracking is skeletal
+- **SSH configuration**: Example config provided but not validated
+
+### Not Implemented
+- **Complete SSH wrapper integration**: The `beam_ssh` function in shell-init is not wired up
+- **Environment variable propagation**: SendEnv/AcceptEnv not tested
+- **ControlMaster handling**: Multiplexing behavior not implemented
+- **Timeout handling**: Basic timeouts exist but need refinement
+- **Retry logic**: No retry mechanism for failed connections
+- **Caching**: Binary cache structure exists but not utilized
+
+## Installation (For Development/Testing)
+
+This project is not yet ready for production use. For development:
 
 ```bash
-# Build and install
-cargo install --path beam-client
+# Build all workspace members
+cargo build --workspace
 
-# Add shell integration (bash, zsh, or fish)
-beam-client shell-init --shell bash >> ~/.bashrc
-# or
-beam-client shell-init --shell zsh >> ~/.zshrc
-# or
-beam-client shell-init --shell fish >> ~/.config/fish/conf.d/beam.fish
+# Run tests
+cargo test --workspace
 
-# Add SSH config
-cat ssh_config.example >> ~/.ssh/config
+# Manual testing of individual components
+# See "Testing" section below
 ```
 
-### Server (remote machine)
+## Usage (When Complete)
 
-```bash
-# Build and install
-cargo install --path beam-server
-
-# Install shell integration (system-wide or user)
-sudo beam-server-handler install --shell bash --system
-# or
-beam-server-handler install --shell bash
-
-# Configure sshd to accept Beam environment variables
-# Add to /etc/ssh/sshd_config:
-# AcceptEnv BEAM_SESSION_ID BEAM_LISTENER_PORT
-# AllowTcpForwarding yes
-# PermitOpen localhost:*
-# Then restart sshd: sudo systemctl restart sshd
-```
-
-## Usage
+*This section describes the intended usage once implementation is complete.*
 
 Just use `ssh` normally:
 
@@ -75,12 +87,14 @@ $ some-command-not-on-server
 - **Server**: OpenSSH server with `AcceptEnv`, `AllowTcpForwarding`, `PermitOpen`
 - **Both**: Rust 1.70+ to build (or pre-built binaries)
 
-## Security Model
+## Security Model (Intended)
 
-- Binary transfer only happens after explicit user approval on client
+*Note: Security features are not fully implemented yet.*
+
+- Binary transfer only happens after explicit user approval on client *(not yet implemented)*
 - BLAKE3 hash verification ensures binary integrity
-- Reverse tunnel only binds to localhost on client
-- Server can only request binaries for the active SSH session
+- Reverse tunnel only binds to localhost on client *(basic implementation exists)*
+- Server can only request binaries for the active SSH session *(session management incomplete)*
 - No persistent daemon required on either side
 
 ## Limitations
@@ -95,7 +109,7 @@ $ some-command-not-on-server
 
 5. **First connection latency**: Initial connection sets up reverse tunnel, adding ~100-500ms latency.
 
-## Architecture
+## Architecture (Intended)
 
 ```
 ┌─────────────────┐     SSH Connection      ┌─────────────────┐
@@ -109,25 +123,56 @@ $ some-command-not-on-server
 └─────────────────┘                         └─────────────────┘
 ```
 
-## Protocol
+**Current state**: Components exist but the SSH wrapper integration and reverse tunnel setup are not yet functional.
+
+## Protocol (Current Implementation)
 
 Custom JSON Lines protocol over TCP:
 
-1. Client → Server: `{"type":"request","session_id":"...","command":"foo","args":[],"arch":"x86_64","os":"linux"}`
-2. Server → Client: `{"type":"response","session_id":"...","exists":true,"compatible":true,"size":12345,"blake3_hash":"..."}`
-3. Client → Server: `{"type":"approve","session_id":"...","approved":true}`
-4. Server → Client: Binary chunks `{"type":"binary_chunk","session_id":"...","offset":0,"data":[...],"is_final":false}`
-5. Final chunk with `is_final:true` triggers BLAKE3 verification
+1. **Handshake**: Magic bytes (`BEAM\0`) + protocol version
+2. **Request**: Client → Server: `{"type":"request","session_id":"...","command":"foo","args":[],"arch":"x86_64","os":"linux"}`
+3. **Response**: Server → Client: `{"type":"response","session_id":"...","exists":true,"compatible":true,"size":12345,"blake3_hash":"..."}`
+4. **Binary streaming**: Server → Client: Binary chunks `{"type":"binary_chunk","session_id":"...","offset":0,"data":[...],"is_final":false}`
+5. **Final chunk**: `{"type":"binary_chunk","...","is_final":true}` triggers BLAKE3 verification
+
+**Note**: The approve message (`{"type":"approve",...}`) is defined in the protocol but not currently used in the actual implementation.
 
 ## Testing
 
 ```bash
-# Run unit tests
+# Run all tests (unit + integration)
 cargo test --workspace
 
-# Manual test: start client listener
-beam-client listen --session-id test123 --port 0
+# Run only unit tests
+cargo test --workspace --lib
 
-# In another terminal, test server handler
-BEAM_SESSION_ID=test123 BEAM_LISTENER_PORT=<port> beam-server-handler handle ls -la
+# Run only integration tests
+cargo test --workspace --test integration
+
+# Manual component testing
+# These test individual components but not the full end-to-end flow
+
+# Test client binary finding
+cargo run -p beam-client -- find-binary ls
+
+# Test client hashing
+cargo run -p beam-client -- hash /bin/ls
+
+# Test server connection (requires running client listener first)
+# Terminal 1:
+cargo run -p beam-client -- listen --session-id test123 --port 0
+# Terminal 2:
+BEAM_SESSION_ID=test123 BEAM_LISTENER_PORT=<port_from_terminal_1> cargo run -p beam-server -- handle ls -la
 ```
+
+## Development Priorities
+
+To move from prototype to working implementation, the following areas need work:
+
+1. **Complete approval flow**: Wire up the approve message exchange between client and server
+2. **SSH integration**: Implement the actual SSH wrapper workflow with environment variables
+3. **End-to-end testing**: Test the full flow from SSH connection to binary execution
+4. **Error handling**: Add proper error recovery and user-friendly error messages
+5. **Session management**: Implement proper session tracking and cleanup
+6. **Shell integration**: Make the shell scripts actually work with SSH
+7. **Configuration validation**: Validate SSH config and server setup
