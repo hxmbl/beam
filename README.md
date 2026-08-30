@@ -54,19 +54,32 @@ Beam streams missing binaries from your client to a remote server over an existi
 - **Retry logic**: No retry mechanism for failed connections
 - **Caching**: Binary cache structure exists but not utilized
 
-## Installation (For Development/Testing)
+## Quick Start
 
-This project is not yet ready for production use. For development:
+Get started with the prototype in a few minutes:
 
 ```bash
-# Build all workspace members
+# Clone and build
+git clone <repo-url>
+cd beam
 cargo build --workspace
 
-# Run tests
+# Run tests to verify everything works
 cargo test --workspace
 
-# Manual testing of individual components
-# See "Testing" section below
+# Test individual components
+# Find a binary on your system
+cargo run -p beam-client -- find-binary ls
+
+# Compute BLAKE3 hash of a file
+cargo run -p beam-client -- hash /bin/ls
+
+# Test client-server connection (manual test)
+# Terminal 1: Start client listener
+cargo run -p beam-client -- listen --session-id test123 --port 0
+
+# Terminal 2: Test server handler (use the port from Terminal 1)
+BEAM_SESSION_ID=test123 BEAM_LISTENER_PORT=<port> cargo run -p beam-server -- handle ls -la
 ```
 
 ## Usage (When Complete)
