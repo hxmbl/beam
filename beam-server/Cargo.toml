@@ -1,0 +1,15 @@
+[package]
+name = "beam-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+beam-common = { path = "../beam-common" }
+clap = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+thiserror = { workspace = true }
+tempfile = { workspace = true }
+shellexpand = { workspace = true }

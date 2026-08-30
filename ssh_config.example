@@ -1,0 +1,28 @@
+# Beam SSH Configuration Example
+# Add this to your ~/.ssh/config
+
+# Enable Beam for all hosts (or restrict to specific hosts)
+Host *
+    # Required for LocalCommand (used by beam-client init)
+    PermitLocalCommand yes
+    
+    # Send Beam environment variables to server
+    SendEnv BEAM_SESSION_ID BEAM_LISTENER_PORT
+    
+    # Connection multiplexing - REQUIRED for reverse port forwarding
+    # Note: With ControlMaster, multiplexed sessions share the same Beam session.
+    # For per-session isolation, use ControlMaster=no (see below).
+    ControlMaster auto
+    ControlPath ~/.ssh/control-%r@%h:%p
+    ControlPersist 10m
+
+# Alternative: Per-session isolation (no multiplexing)
+# Host beam-*
+#     ControlMaster no
+#     PermitLocalCommand yes
+#     SendEnv BEAM_SESSION_ID BEAM_LISTENER_PORT
+
+# Server-side requirements (add to /etc/ssh/sshd_config on the server):
+# AcceptEnv BEAM_SESSION_ID BEAM_LISTENER_PORT
+# AllowTcpForwarding yes
+# PermitOpen localhost:*
