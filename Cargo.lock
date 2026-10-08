@@ -89,7 +89,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "beam-server"
+name = "beam-server-handler"
 version = "0.1.0"
 dependencies = [
  "beam-common",

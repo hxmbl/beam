@@ -145,8 +145,14 @@ impl BeamClient {
         let config = self.config.clone();
         let session_id_for_spawn = session_id.clone();
 
-        tokio::spawn(async move {
-            Self::accept_loop(listener, sessions, binary_cache, config, session_id_for_spawn).await;
+        // Spawn listener in a detached thread with its own runtime
+        // This ensures the listener survives even when the current tokio runtime is dropped
+        // (e.g., when init command exits but the SSH session is still ongoing)
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                Self::accept_loop(listener, sessions, binary_cache, config, session_id_for_spawn).await;
+            });
         });
 
         let mut sessions_guard = self.sessions.lock().await;
@@ -319,13 +325,8 @@ impl BeamClient {
                 }
             }
 
-            // Prompt user
+            // Prompt user for approval
             let approved = Self::prompt_user(&command, &args, &metadata.as_ref().unwrap()).await;
-            
-            // Send approval to server
-            let _approve_msg = ClientMessage::Approve { session_id: session_id.clone(), approved };
-            // Note: In real implementation, we'd send this back through the connection
-            // For now, we handle it by checking the channel
             
             if approved {
                 // Stream binary
@@ -550,34 +551,55 @@ impl BeamClient {
 # Beam SSH wrapper
 beam_ssh() {
     local session_id=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)
-    local port=0
     local ctrl_path="${BEAM_CONTROL_PATH:-~/.ssh/control-%r@%h:%p}"
+    local listener_pid=""
+    local listener_port=""
     
-    # Start beam client and get assigned port
-    local beam_output
-    beam_output=$(beam-client init "$@" --control-path "$ctrl_path" 2>/dev/null)
+    # Start beam listener in background
+    beam-client listen --session-id "$session_id" --port 0 --control-path "$ctrl_path" >/tmp/beam-$session_id.log 2>&1 &
+    listener_pid=$!
     
-    if [ $? -ne 0 ]; then
-        echo "Failed to initialize beam client" >&2
+    # Wait for listener to start and print port
+    local start_time=$(date +%s)
+    local timeout=5
+    while [ -z "$listener_port" ] && [ $(($(date +%s) - start_time)) -lt $timeout ]; do
+        listener_port=$(tail -1 /tmp/beam-$session_id.log 2>/dev/null | grep -oE '[0-9]+' | head -1)
+        [ -n "$listener_port" ] && break
+        sleep 0.1
+    done
+    
+    if [ -z "$listener_port" ]; then
+        echo "Failed to start beam listener" >&2
+        kill $listener_pid 2>/dev/null
         command ssh "$@"
         return $?
     fi
     
-    # Extract environment variables
-    export BEAM_SESSION_ID=$(echo "$beam_output" | grep "^BEAM_SESSION_ID=" | cut -d= -f2)
-    export BEAM_LISTENER_PORT=$(echo "$beam_output" | grep "^BEAM_LISTENER_PORT=" | cut -d= -f2)
+    # Export environment variables for SSH to send
+    export BEAM_SESSION_ID="$session_id"
+    export BEAM_LISTENER_PORT="$listener_port"
     
-    if [ -z "$BEAM_SESSION_ID" ] || [ -z "$BEAM_LISTENER_PORT" ]; then
-        echo "Failed to parse beam client output" >&2
-        command ssh "$@"
-        return $?
-    fi
+    # Add inline -R flag to SSH command
+    # Extract host from SSH args (first arg that looks like user@host)
+    local ssh_host=""
+    for arg in "$@"; do
+        if [[ "$arg" == *@* ]]; then
+            ssh_host="$arg"
+            break
+        fi
+    done
     
-    # Run ssh with beam environment
-    command ssh "$@"
+    # Run SSH with inline -R and SendEnv
+    command ssh \
+        -o "SendEnv=BEAM_SESSION_ID BEAM_LISTENER_PORT" \
+        -R "$listener_port:localhost:$listener_port" \
+        "$@"
     local ret=$?
     
     # Cleanup
+    kill $listener_pid 2>/dev/null
+    wait $listener_pid 2>/dev/null
+    rm -f /tmp/beam-$session_id.log
     unset BEAM_SESSION_ID BEAM_LISTENER_PORT
     return $ret
 }
@@ -594,26 +616,42 @@ function beam_ssh
         set ctrl_path ~/.ssh/control-%r@%h:%p
     end
     
-    set -l beam_output (beam-client init $argv --control-path "$ctrl_path" 2>/dev/null)
+    # Start beam listener in background
+    beam-client listen --session-id "$session_id" --port 0 --control-path "$ctrl_path" >/tmp/beam-$session_id.log 2>&1 &
+    set -l listener_pid $last_pid
     
-    if test $status -ne 0
-        echo "Failed to initialize beam client" >&2
+    # Wait for listener to start and print port
+    set -l start_time (date +%s)
+    set -l timeout 5
+    set -l listener_port ""
+    while [ -z "$listener_port" ] and [ -lt (math "(date +%s) - $start_time") $timeout ]
+        set listener_port (tail -1 /tmp/beam-$session_id.log 2>/dev/null | string replace -r "Listening on port ([0-9]+)" "$1")
+        [ -n "$listener_port" ] and break
+        sleep 0.1
+    end
+    
+    if [ -z "$listener_port" ]
+        echo "Failed to start beam listener" >&2
+        kill $listener_pid
         command ssh $argv
         return $status
     end
     
-    set -gx BEAM_SESSION_ID (echo "$beam_output" | grep "^BEAM_SESSION_ID=" | cut -d= -f2)
-    set -gx BEAM_LISTENER_PORT (echo "$beam_output" | grep "^BEAM_LISTENER_PORT=" | cut -d= -f2)
+    # Set environment variables
+    set -gx BEAM_SESSION_ID "$session_id"
+    set -gx BEAM_LISTENER_PORT "$listener_port"
     
-    if test -z "$BEAM_SESSION_ID" -o -z "$BEAM_LISTENER_PORT"
-        echo "Failed to parse beam client output" >&2
-        command ssh $argv
-        return $status
-    end
-    
-    command ssh $argv
+    # Run SSH with inline -R and SendEnv
+    command ssh \
+        -o "SendEnv=BEAM_SESSION_ID BEAM_LISTENER_PORT" \
+        -R "$listener_port:localhost:$listener_port" \
+        $argv
     set -l ret $status
     
+    # Cleanup
+    kill $listener_pid
+    wait $listener_pid
+    rm -f /tmp/beam-$session_id.log
     set -e BEAM_SESSION_ID BEAM_LISTENER_PORT
     return $ret
 end

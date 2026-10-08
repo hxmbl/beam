@@ -28,7 +28,7 @@ Beam streams missing binaries from your client to a remote server over an existi
 ## Current Status
 
 ### Implemented
-- **Workspace structure**: Clean separation into `beam-client`, `beam-server`, `beam-common`
+- **Workspace structure**: Clean separation into `beam-client`, `beam-server-handler`, `beam-common`
 - **Protocol design**: JSON Lines protocol with magic bytes and version negotiation
 - **Client binary discovery**: Finds binaries in PATH and allowed paths
 - **Binary metadata**: Size and BLAKE3 hash computation
@@ -79,7 +79,7 @@ cargo run -p beam-client -- hash /bin/ls
 cargo run -p beam-client -- listen --session-id test123 --port 0
 
 # Terminal 2: Test server handler (use the port from Terminal 1)
-BEAM_SESSION_ID=test123 BEAM_LISTENER_PORT=<port> cargo run -p beam-server -- handle ls -la
+BEAM_SESSION_ID=test123 BEAM_LISTENER_PORT=<port> cargo run -p beam-server-handler -- handle ls -la
 ```
 
 ## Usage (When Complete)
@@ -128,7 +128,7 @@ $ some-command-not-on-server
 ┌─────────────────┐     SSH Connection      ┌─────────────────┐
 │    Client       │ ◄─────────────────────► │    Server       │
 │                 │                         │                 │
-│  beam-client    │ ◄── Reverse Tunnel ───► │ beam-server-    │
+│  beam-client    │ ◄── Reverse Tunnel ───► │ beam-server-handler│
 │  (listener)     │     (localhost:port)    │ handler         │
 │                 │                         │                 │
 │  ~/.bashrc:     │                         │  command_not_   │
@@ -175,7 +175,7 @@ cargo run -p beam-client -- hash /bin/ls
 # Terminal 1:
 cargo run -p beam-client -- listen --session-id test123 --port 0
 # Terminal 2:
-BEAM_SESSION_ID=test123 BEAM_LISTENER_PORT=<port_from_terminal_1> cargo run -p beam-server -- handle ls -la
+BEAM_SESSION_ID=test123 BEAM_LISTENER_PORT=<port_from_terminal_1> cargo run -p beam-server-handler -- handle ls -la
 ```
 
 ## Development Priorities

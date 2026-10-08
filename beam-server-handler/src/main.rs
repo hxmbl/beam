@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use tempfile::NamedTempFile;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream as AsyncTcpStream;
 use tokio::time::timeout;
 
@@ -107,8 +107,40 @@ impl ServerHandler {
         Ok(())
     }
 
-    async fn read_response(&self, stream: &mut AsyncTcpStream) -> Result<ServerMessage> {
-        let mut reader = BufReader::new(stream);
+    async fn send_handshake_to_writer(&self, writer: &mut tokio::io::WriteHalf<AsyncTcpStream>) -> Result<()> {
+        writer.write_all(MAGIC_BYTES).await?;
+        let version_bytes = PROTOCOL_VERSION.as_bytes();
+        writer.write_all(&[version_bytes.len() as u8]).await?;
+        writer.write_all(version_bytes).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
+    async fn send_request_to_writer(
+        &self,
+        writer: &mut tokio::io::WriteHalf<AsyncTcpStream>,
+        command: &str,
+        args: &[String],
+    ) -> Result<()> {
+        let msg = ClientMessage::Request {
+            session_id: self.session_id.clone(),
+            command: command.to_string(),
+            args: args.to_vec(),
+            arch: self.arch.clone(),
+            os: self.os.clone(),
+        };
+        
+        let json = serde_json::to_string(&msg)?;
+        writer.write_all(json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
+    async fn read_response<R: AsyncRead + Unpin>(
+        &self, 
+        reader: &mut BufReader<R>,
+    ) -> Result<ServerMessage> {
         let mut line = String::new();
         
         let n = timeout(Duration::from_secs(30), reader.read_line(&mut line))
@@ -122,9 +154,9 @@ impl ServerHandler {
         Ok(msg)
     }
 
-    async fn handle_binary_stream(
+    async fn handle_binary_stream<R: AsyncRead + Unpin>(
         &self,
-        stream: &mut AsyncTcpStream,
+        reader: &mut BufReader<R>,
         expected_hash: &str,
         expected_size: u64,
     ) -> Result<PathBuf> {
@@ -132,7 +164,6 @@ impl ServerHandler {
         let temp_path = temp_file.path().to_path_buf();
         let mut hasher = blake3::Hasher::new();
         let mut received = 0u64;
-        let mut reader = BufReader::new(&mut *stream);
         let mut line = String::new();
 
         loop {
@@ -170,7 +201,7 @@ impl ServerHandler {
                     }
                 }
                 ServerMessage::Error { message: _, .. } => {
-                    return Err(ProtocolError::InvalidFormat); // Server error during transfer
+                    return Err(ProtocolError::InvalidFormat);
                 }
                 _ => {
                     return Err(ProtocolError::InvalidFormat);
@@ -201,10 +232,12 @@ impl ServerHandler {
         }
         std::fs::set_permissions(&temp_path, perms)?;
 
-        // Keep the temp file (don't delete on drop)
+        // Keep the temp file
         temp_file.disable_cleanup(true);
         Ok(temp_path)
     }
+
+
 
     async fn execute_binary(&self, path: &Path, args: &[String]) -> Result<i32> {
         let mut cmd = Command::new(path);
@@ -220,11 +253,19 @@ impl ServerHandler {
     }
 
     pub async fn handle_command(&self, command: &str, args: &[String]) -> Result<i32> {
-        let mut stream = self.connect_to_client().await?;
-        self.send_handshake(&mut stream).await?;
-        self.send_request(&mut stream, command, args).await?;
+        let stream = self.connect_to_client().await?;
         
-        let response = self.read_response(&mut stream).await?;
+        // Split stream into reader and writer halves
+        let (reader_half, writer_half) = tokio::io::split(stream);
+        let mut reader = BufReader::new(reader_half);
+        let mut writer = writer_half;
+        
+        // Write handshake and request directly to writer
+        self.send_handshake_to_writer(&mut writer).await?;
+        self.send_request_to_writer(&mut writer, command, args).await?;
+        
+        // Use the reader for all reads
+        let response = self.read_response(&mut reader).await?;
         
         match response {
             ServerMessage::Response { exists, compatible, size, blake3_hash, error, .. } => {
@@ -249,7 +290,7 @@ impl ServerHandler {
                 // The client will prompt and send Approve message
                 // We wait for the binary stream
                 
-                let binary_path = self.handle_binary_stream(&mut stream, &hash, size).await?;
+                let binary_path = self.handle_binary_stream(&mut reader, &hash, size).await?;
                 let exit_code = self.execute_binary(&binary_path, args).await?;
                 
                 // Cleanup temp file
