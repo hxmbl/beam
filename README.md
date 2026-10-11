@@ -189,3 +189,7 @@ To move from prototype to working implementation, the following areas need work:
 5. **Session management**: Implement proper session tracking and cleanup
 6. **Shell integration**: Make the shell scripts actually work with SSH
 7. **Configuration validation**: Validate SSH config and server setup
+
+## License
+
+MIT — see [LICENSE](LICENSE).
