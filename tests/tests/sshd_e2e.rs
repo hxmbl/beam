@@ -11,9 +11,12 @@
 //! command that only exists on the client. The test answers the approval
 //! prompt by typing into the terminal, then checks output and exit code.
 //!
+//! Wire size is checked in `loopback.rs`, which counts bytes on the socket.
+//!
 //! Client and server are the same machine here, so "missing on the server"
 //! means: only on the client's PATH (a temp dir), not on the server's.
 
+use beam_tests::bin_dir;
 use std::io::{Read, Write};
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
@@ -26,32 +29,6 @@ const PROMPT: &str = "allow? [y/N]";
 
 fn enabled() -> bool {
     std::env::var("BEAM_E2E_SSHD").as_deref() == Ok("1")
-}
-
-/// Directory holding the beam binaries, built on demand.
-fn bin_dir() -> PathBuf {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let status = Command::new(cargo)
-        .args([
-            "build",
-            "-q",
-            "-p",
-            "beam-client",
-            "-p",
-            "beam-server-handler",
-        ])
-        .status()
-        .expect("run cargo build");
-    assert!(status.success(), "building beam binaries failed");
-    // target/<profile>/deps/sshd_e2e-<hash> -> target/<profile>
-    let exe = std::env::current_exe().unwrap();
-    let dir = exe.parent().unwrap().parent().unwrap().to_path_buf();
-    assert!(
-        dir.join("beam-client").exists(),
-        "no beam-client in {dir:?}"
-    );
-    assert!(dir.join("beam-server-handler").exists());
-    dir
 }
 
 fn free_port() -> u16 {
@@ -392,7 +369,25 @@ fn ssh_end_to_end_with_real_sshd() {
     assert!(out.output.contains("not found here or on the client"));
     assert_eq!(out.code, 127);
 
-    // 6. zsh on both sides.
+    // 6. A multi-MB binary goes through the real tunnel and runs.
+    let dir = client_bin(&sshd, "big");
+    let mut big = b"#!/bin/sh\necho \"big ok: $*\"\nexit 0\n".to_vec();
+    let line = [b'x'; 1023];
+    while big.len() < 4 * 1024 * 1024 {
+        big.extend_from_slice(&line);
+        big.push(b'\n');
+    }
+    let target = dir.join("beam-big");
+    std::fs::write(&target, &big).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = run(&sshd, case(dir, "beam-big -v", Some("y")));
+    println!("--- big ({} bytes) ---\n{}", big.len(), out.output);
+    assert!(out.prompted);
+    assert!(out.output.contains("big ok: -v"), "{}", out.output);
+    assert_eq!(out.code, 0);
+
+    // 7. zsh on both sides.
     if Command::new("zsh").arg("-c").arg("true").status().is_ok() {
         let mut c = case(client_bin(&sshd, "zsh"), piped, Some("y"));
         c.shell = "zsh";
