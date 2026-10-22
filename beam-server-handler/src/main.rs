@@ -11,6 +11,8 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream as AsyncTcpStream;
 use tokio::time::timeout;
 
+mod hook;
+
 /// Exit code for "command not found", matching the shell's own.
 const EXIT_NOT_FOUND: i32 = 127;
 /// Exit code for "found but cannot be run" (arch mismatch, failed integrity check).
@@ -40,7 +42,13 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Install shell integration
+    /// Print the command-not-found hook for a shell (eval it from the shell rc)
+    ShellInit {
+        /// Shell type (bash, zsh, fish)
+        #[arg(long, default_value = "bash")]
+        shell: String,
+    },
+    /// Append the command-not-found hook to the shell rc file
     Install {
         /// Shell type (bash, zsh, fish)
         #[arg(long, default_value = "bash")]
@@ -304,8 +312,8 @@ impl ServerHandler {
             _ => return Err(ProtocolError::InvalidFormat),
         };
 
-        // The client is now asking the user. Wait for the decision.
-        eprintln!("beam: {command}: not installed here, waiting for approval on the client...");
+        // The client is now asking the user on its own terminal (with ssh
+        // paused, so nothing we print would show up yet). Wait for the decision.
         match self.read_message(&mut reader, APPROVAL_WAIT).await? {
             ServerMessage::Approval { approved: true, .. } => {}
             ServerMessage::Approval {
@@ -347,68 +355,6 @@ impl ServerHandler {
 
         result
     }
-
-    fn install_shell_integration(shell: &str, system: bool) -> String {
-        let _install_path = if system {
-            match shell {
-                "bash" => "/etc/bash.bashrc".to_string(),
-                "zsh" => "/etc/zsh/zshrc".to_string(),
-                "fish" => "/etc/fish/conf.d/beam.fish".to_string(),
-                _ => return String::new(),
-            }
-        } else {
-            match shell {
-                "bash" => "~/.bashrc".to_string(),
-                "zsh" => "~/.zshrc".to_string(),
-                "fish" => "~/.config/fish/conf.d/beam.fish".to_string(),
-                _ => return String::new(),
-            }
-        };
-
-        match shell {
-            "bash" | "zsh" => r#"
-# Beam command-not-found handler
-beam_command_not_found_handle() {
-    local cmd="$1"
-    shift
-    if command -v beam-server-handler >/dev/null 2>&1; then
-        beam-server-handler handle "$cmd" "$@"
-        return $?
-    fi
-    return 127
-}
-
-# Bash
-if [ -n "$BASH_VERSION" ]; then
-    command_not_found_handle() {
-        beam_command_not_found_handle "$@"
-    }
-fi
-
-# Zsh
-if [ -n "$ZSH_VERSION" ]; then
-    command_not_found_handler() {
-        beam_command_not_found_handle "$@"
-    }
-fi
-"#
-            .to_string(),
-            "fish" => r#"
-# Beam command-not-found handler for fish
-function fish_command_not_found --on-event fish_command_not_found
-    set -l cmd $argv[1]
-    set -l args $argv[2..]
-    if command -v beam-server-handler >/dev/null 2>&1
-        beam-server-handler handle $cmd $args
-        return $status
-    end
-    return 127
-end
-"#
-            .to_string(),
-            _ => String::new(),
-        }
-    }
 }
 
 fn main() -> Result<()> {
@@ -433,24 +379,26 @@ fn main() -> Result<()> {
             };
             std::process::exit(exit_code);
         }
+        Commands::ShellInit { shell } => match hook::script(&shell) {
+            Some(script) => print!("{script}"),
+            None => {
+                eprintln!("beam: unsupported shell '{shell}' (use bash, zsh or fish)");
+                std::process::exit(2);
+            }
+        },
         Commands::Install { shell, system } => {
-            let integration = ServerHandler::install_shell_integration(&shell, system);
-            let path = shellexpand::tilde(&if system {
-                match shell.as_str() {
-                    "bash" => "/etc/bash.bashrc".to_string(),
-                    "zsh" => "/etc/zsh/zshrc".to_string(),
-                    "fish" => "/etc/fish/conf.d/beam.fish".to_string(),
-                    _ => return Ok(()),
-                }
-            } else {
-                match shell.as_str() {
-                    "bash" => "~/.bashrc".to_string(),
-                    "zsh" => "~/.zshrc".to_string(),
-                    "fish" => "~/.config/fish/conf.d/beam.fish".to_string(),
-                    _ => return Ok(()),
-                }
-            })
-            .to_string();
+            let (Some(script), Some(rc)) = (hook::script(&shell), hook::rc_path(&shell, system))
+            else {
+                eprintln!("beam: unsupported shell '{shell}' (use bash, zsh or fish)");
+                std::process::exit(2);
+            };
+            let path = shellexpand::tilde(rc).to_string();
+
+            let existing = std::fs::read_to_string(&path).unwrap_or_default();
+            if existing.contains(hook::MARKER) {
+                println!("Beam hook for {shell} is already in {path}");
+                return Ok(());
+            }
 
             // Create directory if needed
             if let Some(parent) = Path::new(&path).parent() {
@@ -460,10 +408,11 @@ fn main() -> Result<()> {
             // Append to file
             use std::fs::OpenOptions;
             let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-            file.write_all(b"\n# Beam integration\n")?;
-            file.write_all(integration.as_bytes())?;
+            writeln!(file, "\n{}", hook::MARKER)?;
+            file.write_all(script.as_bytes())?;
+            writeln!(file, "# <<< beam command-not-found hook <<<")?;
 
-            println!("Installed beam integration for {} at {}", shell, path);
+            println!("Installed the Beam hook for {shell} in {path}");
         }
         Commands::TestConnection { session_id, port } => {
             let rt = tokio::runtime::Runtime::new()?;

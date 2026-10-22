@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 mod prompt;
+mod ssh;
 use prompt::{Decision, PromptConfig};
 
 #[derive(Parser)]
@@ -48,15 +49,15 @@ enum Commands {
         #[arg(long)]
         control_path: Option<String>,
     },
-    /// Initialize client for a new SSH session (called by shell wrapper)
-    Init {
-        /// SSH target (user@host:port)
-        target: String,
-        /// Path to SSH control socket
-        #[arg(long)]
-        control_path: Option<String>,
+    /// Run ssh with Beam: start a listener, add the reverse forward and
+    /// SendEnv options, and answer the server's requests (used by the shell
+    /// wrapper: `beam-client ssh -- <ssh args>`)
+    Ssh {
+        /// Arguments for ssh, passed through unchanged
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
-    /// Generate shell integration script
+    /// Print the shell integration script (eval it from your shell rc)
     ShellInit {
         /// Shell type (bash, zsh, fish)
         #[arg(long, default_value = "bash")]
@@ -552,163 +553,6 @@ impl BeamClient {
         cache.lock().await.insert(key, meta.clone());
         Ok(meta)
     }
-
-    async fn init_session(target: &str, control_path: Option<String>) -> Result<(String, u16)> {
-        let session_id = Uuid::new_v4().to_string();
-        let port = Self::find_free_port().await?;
-
-        // Determine control path
-        let ctrl_path = control_path.unwrap_or_else(|| "~/.ssh/control-%r@%h:%p".to_string());
-
-        // Expand tilde
-        let ctrl_path = shellexpand::tilde(&ctrl_path).to_string();
-
-        // Start listener
-        let config = ClientConfig::default();
-        let client = BeamClient::new(config);
-        let addr = format!("127.0.0.1:{}", port)
-            .to_socket_addrs()?
-            .next()
-            .ok_or(ProtocolError::InvalidFormat)?;
-        let actual_port = client
-            .start_listener(
-                session_id.clone(),
-                addr,
-                Some(target.to_string()),
-                Some(ctrl_path),
-            )
-            .await?;
-
-        // Output environment variables for shell wrapper
-        println!("BEAM_SESSION_ID={}", session_id);
-        println!("BEAM_LISTENER_PORT={}", actual_port);
-
-        Ok((session_id, actual_port))
-    }
-
-    async fn find_free_port() -> Result<u16> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let port = listener.local_addr()?.port();
-        drop(listener);
-        Ok(port)
-    }
-
-    fn shell_init(shell: &str) -> String {
-        match shell {
-            "bash" | "zsh" => r#"
-# Beam SSH wrapper
-beam_ssh() {
-    local session_id=$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16)
-    local ctrl_path="${BEAM_CONTROL_PATH:-~/.ssh/control-%r@%h:%p}"
-    local listener_pid=""
-    local listener_port=""
-    
-    # Start beam listener in background
-    beam-client listen --session-id "$session_id" --port 0 --control-path "$ctrl_path" >/tmp/beam-$session_id.log 2>&1 &
-    listener_pid=$!
-    
-    # Wait for listener to start and print port
-    local start_time=$(date +%s)
-    local timeout=5
-    while [ -z "$listener_port" ] && [ $(($(date +%s) - start_time)) -lt $timeout ]; do
-        listener_port=$(tail -1 /tmp/beam-$session_id.log 2>/dev/null | grep -oE '[0-9]+' | head -1)
-        [ -n "$listener_port" ] && break
-        sleep 0.1
-    done
-    
-    if [ -z "$listener_port" ]; then
-        echo "Failed to start beam listener" >&2
-        kill $listener_pid 2>/dev/null
-        command ssh "$@"
-        return $?
-    fi
-    
-    # Export environment variables for SSH to send
-    export BEAM_SESSION_ID="$session_id"
-    export BEAM_LISTENER_PORT="$listener_port"
-    
-    # Add inline -R flag to SSH command
-    # Extract host from SSH args (first arg that looks like user@host)
-    local ssh_host=""
-    for arg in "$@"; do
-        if [[ "$arg" == *@* ]]; then
-            ssh_host="$arg"
-            break
-        fi
-    done
-    
-    # Run SSH with inline -R and SendEnv
-    command ssh \
-        -o "SendEnv=BEAM_SESSION_ID BEAM_LISTENER_PORT" \
-        -R "$listener_port:localhost:$listener_port" \
-        "$@"
-    local ret=$?
-    
-    # Cleanup
-    kill $listener_pid 2>/dev/null
-    wait $listener_pid 2>/dev/null
-    rm -f /tmp/beam-$session_id.log
-    unset BEAM_SESSION_ID BEAM_LISTENER_PORT
-    return $ret
-}
-
-# Alias ssh to beam_ssh
-alias ssh=beam_ssh
-"#.to_string(),
-            "fish" => r#"
-# Beam SSH wrapper for fish
-function beam_ssh
-    set -l session_id (uuidgen 2>/dev/null; or cat /proc/sys/kernel/random/uuid 2>/dev/null; or openssl rand -hex 16)
-    set -l ctrl_path "$BEAM_CONTROL_PATH"
-    if not set -q ctrl_path
-        set ctrl_path ~/.ssh/control-%r@%h:%p
-    end
-    
-    # Start beam listener in background
-    beam-client listen --session-id "$session_id" --port 0 --control-path "$ctrl_path" >/tmp/beam-$session_id.log 2>&1 &
-    set -l listener_pid $last_pid
-    
-    # Wait for listener to start and print port
-    set -l start_time (date +%s)
-    set -l timeout 5
-    set -l listener_port ""
-    while [ -z "$listener_port" ] and [ -lt (math "(date +%s) - $start_time") $timeout ]
-        set listener_port (tail -1 /tmp/beam-$session_id.log 2>/dev/null | string replace -r "Listening on port ([0-9]+)" "$1")
-        [ -n "$listener_port" ] and break
-        sleep 0.1
-    end
-    
-    if [ -z "$listener_port" ]
-        echo "Failed to start beam listener" >&2
-        kill $listener_pid
-        command ssh $argv
-        return $status
-    end
-    
-    # Set environment variables
-    set -gx BEAM_SESSION_ID "$session_id"
-    set -gx BEAM_LISTENER_PORT "$listener_port"
-    
-    # Run SSH with inline -R and SendEnv
-    command ssh \
-        -o "SendEnv=BEAM_SESSION_ID BEAM_LISTENER_PORT" \
-        -R "$listener_port:localhost:$listener_port" \
-        $argv
-    set -l ret $status
-    
-    # Cleanup
-    kill $listener_pid
-    wait $listener_pid
-    rm -f /tmp/beam-$session_id.log
-    set -e BEAM_SESSION_ID BEAM_LISTENER_PORT
-    return $ret
-end
-
-alias ssh beam_ssh
-"#.to_string(),
-            _ => String::new(),
-        }
-    }
 }
 
 #[tokio::main]
@@ -736,15 +580,42 @@ async fn main() -> Result<()> {
             // Keep running
             tokio::signal::ctrl_c().await?;
         }
-        Commands::Init {
-            target,
-            control_path,
-        } => {
-            BeamClient::init_session(&target, control_path).await?;
+        Commands::Ssh { args } => {
+            if ssh::is_passthrough(&args) {
+                std::process::exit(ssh::exec_plain(&args));
+            }
+            let listener = match TcpListener::bind("127.0.0.1:0").await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("beam: cannot start listener ({e}); running plain ssh");
+                    std::process::exit(ssh::exec_plain(&args));
+                }
+            };
+            let port = listener.local_addr()?.port();
+            let session_id = Uuid::new_v4().to_string();
+            let config = ClientConfig::default();
+            let prompt = config.prompt.clone();
+            let binary_cache = Arc::new(Mutex::new(HashMap::new()));
+            tokio::spawn(BeamClient::accept_loop(
+                listener,
+                binary_cache,
+                config,
+                session_id.clone(),
+            ));
+            let code = tokio::task::spawn_blocking(move || {
+                ssh::run_session(&session_id, port, &args, &prompt)
+            })
+            .await
+            .unwrap_or(255);
+            std::process::exit(code);
         }
-        Commands::ShellInit { shell } => {
-            print!("{}", BeamClient::shell_init(&shell));
-        }
+        Commands::ShellInit { shell } => match ssh::shell_init(&shell) {
+            Some(script) => print!("{script}"),
+            None => {
+                eprintln!("beam: unsupported shell '{shell}' (use bash, zsh or fish)");
+                std::process::exit(2);
+            }
+        },
         Commands::FindBinary { command } => {
             if let Some(path) = BeamClient::find_binary(&command, &ClientConfig::default())? {
                 println!("{}", path.display());
