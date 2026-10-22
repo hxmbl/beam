@@ -12,15 +12,8 @@ pub enum ClientMessage {
         arch: String,
         os: String,
     },
-    #[serde(rename = "approve")]
-    Approve {
-        session_id: String,
-        approved: bool,
-    },
     #[serde(rename = "ping")]
-    Ping {
-        session_id: String,
-    },
+    Ping { session_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +28,15 @@ pub enum ServerMessage {
         blake3_hash: Option<String>,
         error: Option<String>,
     },
+    /// The user's decision on the client, sent after a `Response` with
+    /// `exists && compatible`. Binary chunks follow only when `approved` is true.
+    #[serde(rename = "approval")]
+    Approval {
+        session_id: String,
+        approved: bool,
+        /// Why the request was denied (user said no, prompt timed out, no TTY).
+        reason: Option<String>,
+    },
     #[serde(rename = "binary_chunk")]
     BinaryChunk {
         session_id: String,
@@ -43,21 +45,15 @@ pub enum ServerMessage {
         is_final: bool,
     },
     #[serde(rename = "error")]
-    Error {
-        session_id: String,
-        message: String,
-    },
+    Error { session_id: String, message: String },
     #[serde(rename = "pong")]
-    Pong {
-        session_id: String,
-    },
+    Pong { session_id: String },
 }
 
 impl ClientMessage {
     pub fn session_id(&self) -> &str {
         match self {
             ClientMessage::Request { session_id, .. } => session_id,
-            ClientMessage::Approve { session_id, .. } => session_id,
             ClientMessage::Ping { session_id } => session_id,
         }
     }
@@ -67,6 +63,7 @@ impl ServerMessage {
     pub fn session_id(&self) -> &str {
         match self {
             ServerMessage::Response { session_id, .. } => session_id,
+            ServerMessage::Approval { session_id, .. } => session_id,
             ServerMessage::BinaryChunk { session_id, .. } => session_id,
             ServerMessage::Error { session_id, .. } => session_id,
             ServerMessage::Pong { session_id } => session_id,
@@ -92,7 +89,8 @@ pub enum ProtocolError {
 
 pub type Result<T> = std::result::Result<T, ProtocolError>;
 
-pub const PROTOCOL_VERSION: &str = "1.0";
+/// 1.1: adds the `approval` message between `response` and the binary stream.
+pub const PROTOCOL_VERSION: &str = "1.1";
 pub const MAGIC_BYTES: &[u8] = b"BEAM\0";
 
 pub fn compute_blake3(data: &[u8]) -> String {
@@ -119,10 +117,10 @@ mod tests {
             arch: "x86_64".to_string(),
             os: "linux".to_string(),
         };
-        
+
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
-        
+
         assert_eq!(parsed.session_id(), "test123");
     }
 
@@ -138,7 +136,7 @@ mod tests {
         use std::io::Write;
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(b"test content").unwrap();
-        
+
         let hash = compute_blake3_file(file.path()).unwrap();
         assert_eq!(hash.len(), 64);
     }
@@ -154,5 +152,25 @@ mod tests {
             error: None,
         };
         assert_eq!(msg.session_id(), "abc");
+    }
+
+    #[test]
+    fn test_approval_roundtrip() {
+        let msg = ServerMessage::Approval {
+            session_id: "s".to_string(),
+            approved: false,
+            reason: Some("denied by user".to_string()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"approval\""));
+        match serde_json::from_str::<ServerMessage>(&json).unwrap() {
+            ServerMessage::Approval {
+                approved, reason, ..
+            } => {
+                assert!(!approved);
+                assert_eq!(reason.as_deref(), Some("denied by user"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

@@ -1,28 +1,60 @@
-# Beam SSH Configuration Example
-# Add this to your ~/.ssh/config
-
-# Enable Beam for all hosts (or restrict to specific hosts)
-Host *
-    # Required for LocalCommand (used by beam-client init)
-    PermitLocalCommand yes
-    
-    # Send Beam environment variables to server
-    SendEnv BEAM_SESSION_ID BEAM_LISTENER_PORT
-    
-    # Connection multiplexing - REQUIRED for reverse port forwarding
-    # Note: With ControlMaster, multiplexed sessions share the same Beam session.
-    # For per-session isolation, use ControlMaster=no (see below).
-    ControlMaster auto
-    ControlPath ~/.ssh/control-%r@%h:%p
-    ControlPersist 10m
-
-# Alternative: Per-session isolation (no multiplexing)
-# Host beam-*
-#     ControlMaster no
-#     PermitLocalCommand yes
+# Beam SSH setup
+#
+# ---------------------------------------------------------------------------
+# Client (the machine you ssh FROM)
+# ---------------------------------------------------------------------------
+# 1. Put beam-client on your PATH.
+# 2. Load the ssh wrapper from your shell rc:
+#      bash (~/.bashrc):   eval "$(beam-client shell-init --shell bash)"
+#      zsh  (~/.zshrc):    eval "$(beam-client shell-init --shell zsh)"
+#      fish (config.fish): beam-client shell-init --shell fish | source
+#
+# `ssh host` then runs `beam-client ssh -- host`, which starts a listener on
+# 127.0.0.1, and runs the real ssh with:
+#      -o SendEnv=BEAM_SESSION_ID -o SendEnv=BEAM_LISTENER_PORT
+#      -R <remote port>:127.0.0.1:<listener port>
+# so nothing has to be added to ~/.ssh/config for Beam to work.
+# Set BEAM_DISABLE=1 to bypass the wrapper; `ssh -O ...`, `-V`, `-G`, `-Q`
+# always go straight to ssh.
+#
+# Optional, only if you also want plain `command ssh` sessions to forward the
+# variables (they will not have a listener behind them, so this is rarely
+# useful):
+# Host *
 #     SendEnv BEAM_SESSION_ID BEAM_LISTENER_PORT
-
-# Server-side requirements (add to /etc/ssh/sshd_config on the server):
-# AcceptEnv BEAM_SESSION_ID BEAM_LISTENER_PORT
-# AllowTcpForwarding yes
-# PermitOpen localhost:*
+#
+# ControlMaster / multiplexing:
+# Beam works with ControlMaster=auto: the extra -R is requested through the
+# existing master and the variables are sent with the new session. Things to
+# know:
+#   - Each `ssh` run gets its own session ID and listener, so multiplexed
+#     sessions do not share approvals.
+#   - With ControlPersist, the reverse forward of a finished session stays
+#     open on the server until the master exits (it points at a listener that
+#     is gone; requests through it fail with "cannot reach the client").
+#   - If you would rather avoid that, disable multiplexing for Beam hosts:
+# Host my-beam-host
+#     ControlMaster no
+#
+# ---------------------------------------------------------------------------
+# Server (the machine you ssh TO)
+# ---------------------------------------------------------------------------
+# /etc/ssh/sshd_config (then reload sshd):
+#     AcceptEnv BEAM_SESSION_ID BEAM_LISTENER_PORT
+#     AllowTcpForwarding remote        # or "yes"; Beam needs remote (-R) forwards
+#     # GatewayPorts must stay "no" (the default) so the forward binds to
+#     # loopback only. PermitOpen does not apply to -R forwards; PermitListen
+#     # (OpenSSH 7.8+) does, and its default ("any") is what Beam needs.
+#
+# Put beam-server-handler on PATH and load the command-not-found hook from
+# the shell rc of the account you log in as:
+#     bash (~/.bashrc):   eval "$(beam-server-handler shell-init --shell bash)"
+#     zsh  (~/.zshrc):    eval "$(beam-server-handler shell-init --shell zsh)"
+#     fish (config.fish): beam-server-handler shell-init --shell fish | source
+# or append it once with:  beam-server-handler install --shell bash
+#
+# Note for bash: `ssh host 'cmd'` runs a non-interactive shell. Some builds
+# (Debian/Ubuntu among them) still read ~/.bashrc for commands run over ssh,
+# but their default .bashrc returns early when not interactive, so put the
+# hook above that check if you want it for one-off commands too. Interactive
+# logins are covered either way.

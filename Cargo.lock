@@ -67,9 +67,11 @@ dependencies = [
  "clap",
  "dirs",
  "home",
+ "libc",
  "serde",
  "serde_json",
  "shellexpand",
+ "tempfile",
  "thiserror",
  "tokio",
  "uuid",
@@ -101,6 +103,14 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+]
+
+[[package]]
+name = "beam-tests"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
 ]
 
 [[package]]
