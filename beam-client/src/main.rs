@@ -1,4 +1,7 @@
-use beam_common::{ClientMessage, ProtocolError, Result, ServerMessage, MAGIC_BYTES, PROTOCOL_VERSION, compute_blake3_file};
+use beam_common::{
+    ClientMessage, MAGIC_BYTES, PROTOCOL_VERSION, ProtocolError, Result, ServerMessage,
+    compute_blake3_file,
+};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -9,11 +12,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(name = "beam-client", version, about = "Beam client - serves binaries to remote servers over SSH")]
+#[command(
+    name = "beam-client",
+    version,
+    about = "Beam client - serves binaries to remote servers over SSH"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -101,7 +108,7 @@ impl Default for ClientConfig {
         let cache_dir = dirs::cache_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("beam");
-        
+
         Self {
             cache_dir,
             allowed_paths: vec![
@@ -137,7 +144,8 @@ impl BeamClient {
 
         // Set up reverse port forward if SSH host provided
         if let (Some(host), Some(ctrl_path)) = (ssh_host, control_path) {
-            self.setup_reverse_forward(&host, actual_port, &ctrl_path).await?;
+            self.setup_reverse_forward(&host, actual_port, &ctrl_path)
+                .await?;
         }
 
         let sessions = self.sessions.clone();
@@ -151,34 +159,55 @@ impl BeamClient {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                Self::accept_loop(listener, sessions, binary_cache, config, session_id_for_spawn).await;
+                Self::accept_loop(
+                    listener,
+                    sessions,
+                    binary_cache,
+                    config,
+                    session_id_for_spawn,
+                )
+                .await;
             });
         });
 
         let mut sessions_guard = self.sessions.lock().await;
         let key = session_id.clone();
-        sessions_guard.insert(key, SessionInfo {
-            session_id,
-            port: actual_port,
-            pending_request: None,
-        });
+        sessions_guard.insert(
+            key,
+            SessionInfo {
+                session_id,
+                port: actual_port,
+                pending_request: None,
+            },
+        );
 
         Ok(actual_port)
     }
 
-    async fn setup_reverse_forward(&self, ssh_host: &str, port: u16, control_path: &str) -> Result<()> {
+    async fn setup_reverse_forward(
+        &self,
+        ssh_host: &str,
+        port: u16,
+        control_path: &str,
+    ) -> Result<()> {
         let forward_spec = format!("{}:localhost:{}", port, port);
         let output = Command::new("ssh")
             .args([
-                "-O", "forward",
-                "-R", &forward_spec,
-                "-S", control_path,
+                "-O",
+                "forward",
+                "-R",
+                &forward_spec,
+                "-S",
+                control_path,
                 ssh_host,
             ])
             .output()?;
-        
+
         if !output.status.success() {
-            eprintln!("Warning: Failed to set up reverse forward: {}", String::from_utf8_lossy(&output.stderr));
+            eprintln!(
+                "Warning: Failed to set up reverse forward: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         Ok(())
     }
@@ -197,9 +226,17 @@ impl BeamClient {
                     let binary_cache = binary_cache.clone();
                     let config = config.clone();
                     let session_id = session_id.clone();
-                    
+
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(stream, sessions, binary_cache, config, session_id).await {
+                        if let Err(e) = Self::handle_connection(
+                            stream,
+                            sessions,
+                            binary_cache,
+                            config,
+                            session_id,
+                        )
+                        .await
+                        {
                             eprintln!("Connection error from {}: {}", addr, e);
                         }
                     });
@@ -249,11 +286,15 @@ impl BeamClient {
             }
 
             let msg: ClientMessage = serde_json::from_str(trimmed)?;
-            
+
             if msg.session_id() != expected_session_id {
                 let err = ServerMessage::Error {
                     session_id: expected_session_id.clone(),
-                    message: format!("Session ID mismatch: expected {}, got {}", expected_session_id, msg.session_id()),
+                    message: format!(
+                        "Session ID mismatch: expected {}, got {}",
+                        expected_session_id,
+                        msg.session_id()
+                    ),
                 };
                 Self::send_message(&mut wr, &err).await?;
                 return Err(ProtocolError::SessionMismatch {
@@ -263,10 +304,30 @@ impl BeamClient {
             }
 
             match msg {
-                ClientMessage::Request { session_id, command, args, arch, os } => {
-                    Self::handle_request(&mut wr, &sessions, &binary_cache, &config, session_id, command, args, arch, os).await?;
+                ClientMessage::Request {
+                    session_id,
+                    command,
+                    args,
+                    arch,
+                    os,
+                } => {
+                    Self::handle_request(
+                        &mut wr,
+                        &sessions,
+                        &binary_cache,
+                        &config,
+                        session_id,
+                        command,
+                        args,
+                        arch,
+                        os,
+                    )
+                    .await?;
                 }
-                ClientMessage::Approve { session_id, approved } => {
+                ClientMessage::Approve {
+                    session_id,
+                    approved,
+                } => {
                     Self::handle_approve(&sessions, session_id, approved).await?;
                 }
                 ClientMessage::Ping { session_id } => {
@@ -294,7 +355,7 @@ impl BeamClient {
     ) -> Result<()> {
         // Find binary
         let binary_path = Self::find_binary(&command, config)?;
-        
+
         let (exists, compatible, metadata) = if let Some(path) = binary_path {
             let meta = Self::get_binary_metadata(&path, binary_cache, &arch, &os).await?;
             let compatible = meta.arch == arch && meta.os == os;
@@ -309,7 +370,11 @@ impl BeamClient {
             compatible: exists && compatible,
             size: metadata.as_ref().map(|m| m.size),
             blake3_hash: metadata.as_ref().map(|m| m.blake3_hash.clone()),
-            error: if !exists { Some(format!("Command '{}' not found on client", command)) } else { None },
+            error: if !exists {
+                Some(format!("Command '{}' not found on client", command))
+            } else {
+                None
+            },
         };
 
         Self::send_message(wr, &response).await?;
@@ -317,7 +382,7 @@ impl BeamClient {
         if exists && compatible {
             // Wait for approval
             let (tx, _rx) = mpsc::channel(1);
-            
+
             {
                 let mut sessions_guard = sessions.lock().await;
                 if let Some(session) = sessions_guard.get_mut(&session_id) {
@@ -327,7 +392,7 @@ impl BeamClient {
 
             // Prompt user for approval
             let approved = Self::prompt_user(&command, &args, &metadata.as_ref().unwrap()).await;
-            
+
             if approved {
                 // Stream binary
                 if let Some(meta) = metadata {
@@ -353,7 +418,12 @@ impl BeamClient {
         let mut sessions_guard = sessions.lock().await;
         if let Some(session) = sessions_guard.get_mut(&session_id) {
             if let Some(tx) = session.pending_request.take() {
-                let _ = tx.send(ClientMessage::Approve { session_id, approved }).await;
+                let _ = tx
+                    .send(ClientMessage::Approve {
+                        session_id,
+                        approved,
+                    })
+                    .await;
             }
         }
         Ok(())
@@ -361,11 +431,24 @@ impl BeamClient {
 
     async fn prompt_user(command: &str, args: &[String], meta: &BinaryMetadata) -> bool {
         use std::io::{self, Write};
-        
+
         println!("\n╭─ Beam Request ──────────────────────────────────────╮");
-        println!("│ Command not found on server: {} {}", command, args.join(" "));
-        println!("│ Found on client: {} ({}, {})", meta.path.display(), meta.arch, meta.os);
-        println!("│ Size: {} bytes, BLAKE3: {}", meta.size, &meta.blake3_hash[..16]);
+        println!(
+            "│ Command not found on server: {} {}",
+            command,
+            args.join(" ")
+        );
+        println!(
+            "│ Found on client: {} ({}, {})",
+            meta.path.display(),
+            meta.arch,
+            meta.os
+        );
+        println!(
+            "│ Size: {} bytes, BLAKE3: {}",
+            meta.size,
+            &meta.blake3_hash[..16]
+        );
         println!("╰──────────────────────────────────────────────────────╯");
         print!("Allow execution? [y/N] ");
         io::stdout().flush().unwrap();
@@ -395,17 +478,17 @@ impl BeamClient {
             if n == 0 {
                 break;
             }
-            
+
             let chunk = &buffer[..n];
             hasher.update(chunk);
-            
+
             let msg = ServerMessage::BinaryChunk {
                 session_id: session_id.to_string(),
                 offset,
                 data: chunk.to_vec(),
                 is_final: false,
             };
-            
+
             Self::send_message(wr, &msg).await?;
             offset += n as u64;
         }
@@ -479,7 +562,7 @@ impl BeamClient {
         _expected_os: &str,
     ) -> Result<BinaryMetadata> {
         let key = path.to_string_lossy().to_string();
-        
+
         // Check cache first
         {
             let cache_guard = cache.lock().await;
@@ -491,7 +574,7 @@ impl BeamClient {
         // Compute metadata
         let size = tokio::fs::metadata(path).await?.len();
         let blake3_hash = compute_blake3_file(path)?;
-        
+
         // Detect architecture (simplified)
         let arch = std::env::consts::ARCH.to_string();
         let os = std::env::consts::OS.to_string();
@@ -511,11 +594,9 @@ impl BeamClient {
     async fn init_session(target: &str, control_path: Option<String>) -> Result<(String, u16)> {
         let session_id = Uuid::new_v4().to_string();
         let port = Self::find_free_port().await?;
-        
+
         // Determine control path
-        let ctrl_path = control_path.unwrap_or_else(|| {
-            format!("~/.ssh/control-%r@%h:%p")
-        });
+        let ctrl_path = control_path.unwrap_or_else(|| format!("~/.ssh/control-%r@%h:%p"));
 
         // Expand tilde
         let ctrl_path = shellexpand::tilde(&ctrl_path).to_string();
@@ -523,13 +604,18 @@ impl BeamClient {
         // Start listener
         let config = ClientConfig::default();
         let client = BeamClient::new(config);
-        let addr = format!("127.0.0.1:{}", port).to_socket_addrs()?.next().ok_or(ProtocolError::InvalidFormat)?;
-        let actual_port = client.start_listener(
-            session_id.clone(),
-            addr,
-            Some(target.to_string()),
-            Some(ctrl_path),
-        ).await?;
+        let addr = format!("127.0.0.1:{}", port)
+            .to_socket_addrs()?
+            .next()
+            .ok_or(ProtocolError::InvalidFormat)?;
+        let actual_port = client
+            .start_listener(
+                session_id.clone(),
+                addr,
+                Some(target.to_string()),
+                Some(ctrl_path),
+            )
+            .await?;
 
         // Output environment variables for shell wrapper
         println!("BEAM_SESSION_ID={}", session_id);
@@ -670,14 +756,28 @@ async fn main() -> Result<()> {
     let client = BeamClient::new(config);
 
     match cli.command {
-        Commands::Listen { session_id, port, host, ssh_host, control_path } => {
-            let addr = format!("{}:{}", host, port).to_socket_addrs()?.next().ok_or(ProtocolError::InvalidFormat)?;
-            let actual_port = client.start_listener(session_id, addr, ssh_host, control_path).await?;
+        Commands::Listen {
+            session_id,
+            port,
+            host,
+            ssh_host,
+            control_path,
+        } => {
+            let addr = format!("{}:{}", host, port)
+                .to_socket_addrs()?
+                .next()
+                .ok_or(ProtocolError::InvalidFormat)?;
+            let actual_port = client
+                .start_listener(session_id, addr, ssh_host, control_path)
+                .await?;
             println!("Listening on port {}", actual_port);
             // Keep running
             tokio::signal::ctrl_c().await?;
         }
-        Commands::Init { target, control_path } => {
+        Commands::Init {
+            target,
+            control_path,
+        } => {
             BeamClient::init_session(&target, control_path).await?;
         }
         Commands::ShellInit { shell } => {

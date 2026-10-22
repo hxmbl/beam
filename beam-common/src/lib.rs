@@ -13,14 +13,9 @@ pub enum ClientMessage {
         os: String,
     },
     #[serde(rename = "approve")]
-    Approve {
-        session_id: String,
-        approved: bool,
-    },
+    Approve { session_id: String, approved: bool },
     #[serde(rename = "ping")]
-    Ping {
-        session_id: String,
-    },
+    Ping { session_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,14 +38,9 @@ pub enum ServerMessage {
         is_final: bool,
     },
     #[serde(rename = "error")]
-    Error {
-        session_id: String,
-        message: String,
-    },
+    Error { session_id: String, message: String },
     #[serde(rename = "pong")]
-    Pong {
-        session_id: String,
-    },
+    Pong { session_id: String },
 }
 
 impl ClientMessage {
@@ -119,10 +109,10 @@ mod tests {
             arch: "x86_64".to_string(),
             os: "linux".to_string(),
         };
-        
+
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
-        
+
         assert_eq!(parsed.session_id(), "test123");
     }
 
@@ -138,7 +128,7 @@ mod tests {
         use std::io::Write;
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(b"test content").unwrap();
-        
+
         let hash = compute_blake3_file(file.path()).unwrap();
         assert_eq!(hash.len(), 64);
     }
