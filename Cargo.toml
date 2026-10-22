@@ -1,5 +1,5 @@
 [workspace]
-members = ["beam-client", "beam-server-handler", "beam-common"]
+members = ["beam-client", "beam-server-handler", "beam-common", "tests"]
 resolver = "2"
 
 [workspace.package]

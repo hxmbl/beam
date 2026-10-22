@@ -281,14 +281,10 @@ impl ServerHandler {
                 compatible,
                 size,
                 blake3_hash,
-                error,
                 ..
             } => {
                 if !exists {
                     eprintln!("beam: {command}: command not found here or on the client");
-                    if let Some(err) = error {
-                        eprintln!("beam: {err}");
-                    }
                     return Ok(EXIT_NOT_FOUND);
                 }
 

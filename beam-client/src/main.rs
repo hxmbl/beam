@@ -228,10 +228,12 @@ impl BeamClient {
                     let session_id = session_id.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            Self::handle_connection(stream, binary_cache, config, session_id).await
+                        match Self::handle_connection(stream, binary_cache, config, session_id)
+                            .await
                         {
-                            eprintln!("Connection error from {}: {}", addr, e);
+                            // Already reported by stream_binary in plain words.
+                            Ok(()) | Err(ProtocolError::Blake3Mismatch { .. }) => {}
+                            Err(e) => eprintln!("beam: connection error from {}: {}", addr, e),
                         }
                     });
                 }

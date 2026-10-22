@@ -106,6 +106,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "beam-tests"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
