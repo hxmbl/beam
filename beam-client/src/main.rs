@@ -9,11 +9,13 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 use uuid::Uuid;
+
+mod prompt;
+use prompt::{Decision, PromptConfig};
 
 #[derive(Parser)]
 #[command(
@@ -77,7 +79,6 @@ enum Commands {
 struct SessionInfo {
     session_id: String,
     port: u16,
-    pending_request: Option<mpsc::Sender<ClientMessage>>,
 }
 
 struct BeamClient {
@@ -91,7 +92,16 @@ struct BeamClient {
 struct ClientConfig {
     cache_dir: PathBuf,
     allowed_paths: Vec<PathBuf>,
-    prompt_timeout: Duration,
+    prompt: PromptConfig,
+}
+
+/// A server's request for a binary, as received on the wire.
+struct BinaryRequest {
+    session_id: String,
+    command: String,
+    args: Vec<String>,
+    arch: String,
+    os: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,7 +128,7 @@ impl Default for ClientConfig {
                 PathBuf::from("/opt/homebrew/bin"),
                 PathBuf::from("/opt/local/bin"),
             ],
-            prompt_timeout: Duration::from_secs(30),
+            prompt: PromptConfig::default(),
         }
     }
 }
@@ -148,7 +158,6 @@ impl BeamClient {
                 .await?;
         }
 
-        let sessions = self.sessions.clone();
         let binary_cache = self.binary_cache.clone();
         let config = self.config.clone();
         let session_id_for_spawn = session_id.clone();
@@ -159,14 +168,7 @@ impl BeamClient {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                Self::accept_loop(
-                    listener,
-                    sessions,
-                    binary_cache,
-                    config,
-                    session_id_for_spawn,
-                )
-                .await;
+                Self::accept_loop(listener, binary_cache, config, session_id_for_spawn).await;
             });
         });
 
@@ -177,7 +179,6 @@ impl BeamClient {
             SessionInfo {
                 session_id,
                 port: actual_port,
-                pending_request: None,
             },
         );
 
@@ -214,7 +215,6 @@ impl BeamClient {
 
     async fn accept_loop(
         listener: TcpListener,
-        sessions: Arc<Mutex<HashMap<String, SessionInfo>>>,
         binary_cache: Arc<Mutex<HashMap<String, BinaryMetadata>>>,
         config: ClientConfig,
         session_id: String,
@@ -222,20 +222,13 @@ impl BeamClient {
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
-                    let sessions = sessions.clone();
                     let binary_cache = binary_cache.clone();
                     let config = config.clone();
                     let session_id = session_id.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_connection(
-                            stream,
-                            sessions,
-                            binary_cache,
-                            config,
-                            session_id,
-                        )
-                        .await
+                        if let Err(e) =
+                            Self::handle_connection(stream, binary_cache, config, session_id).await
                         {
                             eprintln!("Connection error from {}: {}", addr, e);
                         }
@@ -251,7 +244,6 @@ impl BeamClient {
 
     async fn handle_connection(
         mut stream: TcpStream,
-        sessions: Arc<Mutex<HashMap<String, SessionInfo>>>,
         binary_cache: Arc<Mutex<HashMap<String, BinaryMetadata>>>,
         config: ClientConfig,
         expected_session_id: String,
@@ -259,7 +251,7 @@ impl BeamClient {
         // Read magic bytes
         let mut magic = [0u8; 5];
         stream.read_exact(&mut magic).await?;
-        if &magic != MAGIC_BYTES {
+        if magic != MAGIC_BYTES {
             return Err(ProtocolError::InvalidFormat);
         }
 
@@ -311,24 +303,14 @@ impl BeamClient {
                     arch,
                     os,
                 } => {
-                    Self::handle_request(
-                        &mut wr,
-                        &sessions,
-                        &binary_cache,
-                        &config,
+                    let req = BinaryRequest {
                         session_id,
                         command,
                         args,
                         arch,
                         os,
-                    )
-                    .await?;
-                }
-                ClientMessage::Approve {
-                    session_id,
-                    approved,
-                } => {
-                    Self::handle_approve(&sessions, session_id, approved).await?;
+                    };
+                    Self::handle_request(&mut wr, &binary_cache, &config, req).await?;
                 }
                 ClientMessage::Ping { session_id } => {
                     let pong = ServerMessage::Pong { session_id };
@@ -344,15 +326,18 @@ impl BeamClient {
 
     async fn handle_request(
         wr: &mut (impl AsyncWriteExt + Unpin),
-        sessions: &Arc<Mutex<HashMap<String, SessionInfo>>>,
         binary_cache: &Arc<Mutex<HashMap<String, BinaryMetadata>>>,
         config: &ClientConfig,
-        session_id: String,
-        command: String,
-        args: Vec<String>,
-        arch: String,
-        os: String,
+        req: BinaryRequest,
     ) -> Result<()> {
+        let BinaryRequest {
+            session_id,
+            command,
+            args,
+            arch,
+            os,
+        } = req;
+
         // Find binary
         let binary_path = Self::find_binary(&command, config)?;
 
@@ -379,96 +364,63 @@ impl BeamClient {
 
         Self::send_message(wr, &response).await?;
 
-        if exists && compatible {
-            // Wait for approval
-            let (tx, _rx) = mpsc::channel(1);
+        let Some(meta) = metadata.filter(|_| exists && compatible) else {
+            return Ok(());
+        };
 
-            {
-                let mut sessions_guard = sessions.lock().await;
-                if let Some(session) = sessions_guard.get_mut(&session_id) {
-                    session.pending_request = Some(tx);
-                }
-            }
+        // Ask the user on the client's terminal. This blocks, so keep it off
+        // the async workers.
+        let text = Self::prompt_text(&command, &args, &meta, &config.prompt);
+        let prompt_cfg = config.prompt.clone();
+        let decision = tokio::task::spawn_blocking(move || prompt::ask(&prompt_cfg, &text))
+            .await
+            .unwrap_or_else(|e| Decision::NoTty(format!("prompt task failed: {e}")));
 
-            // Prompt user for approval
-            let approved = Self::prompt_user(&command, &args, &metadata.as_ref().unwrap()).await;
+        let approval = ServerMessage::Approval {
+            session_id: session_id.clone(),
+            approved: decision.approved(),
+            reason: decision.reason(),
+        };
+        Self::send_message(wr, &approval).await?;
 
-            if approved {
-                // Stream binary
-                if let Some(meta) = metadata {
-                    Self::stream_binary(wr, &session_id, &meta.path).await?;
-                }
-            } else {
-                let err = ServerMessage::Error {
-                    session_id,
-                    message: "User denied execution".to_string(),
-                };
-                Self::send_message(wr, &err).await?;
-            }
+        if decision.approved() {
+            Self::stream_binary(wr, &session_id, &meta).await?;
         }
 
         Ok(())
     }
 
-    async fn handle_approve(
-        sessions: &Arc<Mutex<HashMap<String, SessionInfo>>>,
-        session_id: String,
-        approved: bool,
-    ) -> Result<()> {
-        let mut sessions_guard = sessions.lock().await;
-        if let Some(session) = sessions_guard.get_mut(&session_id) {
-            if let Some(tx) = session.pending_request.take() {
-                let _ = tx
-                    .send(ClientMessage::Approve {
-                        session_id,
-                        approved,
-                    })
-                    .await;
-            }
-        }
-        Ok(())
-    }
-
-    async fn prompt_user(command: &str, args: &[String], meta: &BinaryMetadata) -> bool {
-        use std::io::{self, Write};
-
-        println!("\n╭─ Beam Request ──────────────────────────────────────╮");
-        println!(
-            "│ Command not found on server: {} {}",
-            command,
-            args.join(" ")
-        );
-        println!(
-            "│ Found on client: {} ({}, {})",
-            meta.path.display(),
-            meta.arch,
-            meta.os
-        );
-        println!(
-            "│ Size: {} bytes, BLAKE3: {}",
-            meta.size,
-            &meta.blake3_hash[..16]
-        );
-        println!("╰──────────────────────────────────────────────────────╯");
-        print!("Allow execution? [y/N] ");
-        io::stdout().flush().unwrap();
-
-        // In a real implementation, we'd read with timeout
-        // For prototype, simple read
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_ok() {
-            input.trim().eq_ignore_ascii_case("y")
+    fn prompt_text(
+        command: &str,
+        args: &[String],
+        meta: &BinaryMetadata,
+        prompt: &PromptConfig,
+    ) -> String {
+        let shown_args = if args.is_empty() {
+            String::new()
         } else {
-            false
-        }
+            format!(" {}", args.join(" "))
+        };
+        format!(
+            "\nbeam: the remote host asked to run `{command}{shown_args}`, which it does not have.\n\
+             beam:   send {} ({} bytes, blake3 {}…) and run it there?\n\
+             beam: allow? [y/N] (denies in {}s) ",
+            meta.path.display(),
+            meta.size,
+            &meta.blake3_hash[..16],
+            prompt.timeout.as_secs()
+        )
     }
 
+    /// Stream the file the user approved. The server checks the stream against
+    /// the size and hash it was shown, so if the file changed since then the
+    /// server refuses to run it; we warn about it here as well.
     async fn stream_binary(
         wr: &mut (impl AsyncWriteExt + Unpin),
         session_id: &str,
-        path: &Path,
+        meta: &BinaryMetadata,
     ) -> Result<()> {
-        let mut file = tokio::fs::File::open(path).await?;
+        let mut file = tokio::fs::File::open(&meta.path).await?;
         let mut buffer = vec![0u8; 64 * 1024]; // 64KB chunks
         let mut offset = 0u64;
         let mut hasher = blake3::Hasher::new();
@@ -493,8 +445,6 @@ impl BeamClient {
             offset += n as u64;
         }
 
-        // Send final chunk with hash
-        let final_hash = hasher.finalize().to_hex().to_string();
         let msg = ServerMessage::BinaryChunk {
             session_id: session_id.to_string(),
             offset,
@@ -503,12 +453,15 @@ impl BeamClient {
         };
         Self::send_message(wr, &msg).await?;
 
-        // Verify hash matches expected
-        let expected = compute_blake3_file(path)?;
-        if final_hash != expected {
+        let sent_hash = hasher.finalize().to_hex().to_string();
+        if sent_hash != meta.blake3_hash {
+            eprintln!(
+                "beam: warning: {} changed after it was approved; the server will refuse it",
+                meta.path.display()
+            );
             return Err(ProtocolError::Blake3Mismatch {
-                expected,
-                actual: final_hash,
+                expected: meta.blake3_hash.clone(),
+                actual: sent_hash,
             });
         }
 
@@ -539,10 +492,10 @@ impl BeamClient {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    if let Ok(metadata) = path.metadata() {
-                        if metadata.permissions().mode() & 0o111 != 0 {
-                            return Ok(Some(path));
-                        }
+                    if let Ok(metadata) = path.metadata()
+                        && metadata.permissions().mode() & 0o111 != 0
+                    {
+                        return Ok(Some(path));
                     }
                 }
                 #[cfg(not(unix))]
@@ -561,7 +514,16 @@ impl BeamClient {
         _expected_arch: &str,
         _expected_os: &str,
     ) -> Result<BinaryMetadata> {
-        let key = path.to_string_lossy().to_string();
+        // Key on size and mtime too, so a binary that is rebuilt or replaced
+        // during a long session is re-hashed instead of served with a stale hash.
+        let fs_meta = tokio::fs::metadata(path).await?;
+        let mtime = fs_meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let key = format!("{}\0{}\0{}", path.to_string_lossy(), fs_meta.len(), mtime);
 
         // Check cache first
         {
@@ -572,7 +534,7 @@ impl BeamClient {
         }
 
         // Compute metadata
-        let size = tokio::fs::metadata(path).await?.len();
+        let size = fs_meta.len();
         let blake3_hash = compute_blake3_file(path)?;
 
         // Detect architecture (simplified)
@@ -596,7 +558,7 @@ impl BeamClient {
         let port = Self::find_free_port().await?;
 
         // Determine control path
-        let ctrl_path = control_path.unwrap_or_else(|| format!("~/.ssh/control-%r@%h:%p"));
+        let ctrl_path = control_path.unwrap_or_else(|| "~/.ssh/control-%r@%h:%p".to_string());
 
         // Expand tilde
         let ctrl_path = shellexpand::tilde(&ctrl_path).to_string();

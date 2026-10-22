@@ -7,9 +7,17 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use tempfile::NamedTempFile;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream as AsyncTcpStream;
 use tokio::time::timeout;
+
+/// Exit code for "command not found", matching the shell's own.
+const EXIT_NOT_FOUND: i32 = 127;
+/// Exit code for "found but cannot be run" (arch mismatch, failed integrity check).
+const EXIT_CANNOT_RUN: i32 = 126;
+/// Longest we wait for the user to answer on the client. The client denies on
+/// its own after its prompt timeout (30s by default), so this is only a backstop.
+const APPROVAL_WAIT: Duration = Duration::from_secs(300);
 
 #[derive(Parser)]
 #[command(
@@ -28,7 +36,8 @@ enum Commands {
     Handle {
         /// Command name
         command: String,
-        /// Command arguments
+        /// Command arguments (passed through untouched, including ones that start with '-')
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Install shell integration
@@ -59,13 +68,13 @@ struct ServerHandler {
 }
 
 impl ServerHandler {
-    fn new() -> Result<Self> {
-        let session_id =
-            std::env::var("BEAM_SESSION_ID").map_err(|_| ProtocolError::InvalidFormat)?;
+    fn from_env() -> std::result::Result<Self, String> {
+        let session_id = std::env::var("BEAM_SESSION_ID")
+            .map_err(|_| "BEAM_SESSION_ID is not set (is AcceptEnv configured?)".to_string())?;
         let listener_port = std::env::var("BEAM_LISTENER_PORT")
-            .map_err(|_| ProtocolError::InvalidFormat)?
+            .map_err(|_| "BEAM_LISTENER_PORT is not set (is AcceptEnv configured?)".to_string())?
             .parse()
-            .map_err(|_| ProtocolError::InvalidFormat)?;
+            .map_err(|_| "BEAM_LISTENER_PORT is not a port number".to_string())?;
 
         Ok(Self {
             session_id,
@@ -81,36 +90,6 @@ impl ServerHandler {
             .await
             .map_err(|_| ProtocolError::ConnectionClosed)??;
         Ok(stream)
-    }
-
-    async fn send_handshake(&self, stream: &mut AsyncTcpStream) -> Result<()> {
-        stream.write_all(MAGIC_BYTES).await?;
-        let version_bytes = PROTOCOL_VERSION.as_bytes();
-        stream.write_all(&[version_bytes.len() as u8]).await?;
-        stream.write_all(version_bytes).await?;
-        stream.flush().await?;
-        Ok(())
-    }
-
-    async fn send_request(
-        &self,
-        stream: &mut AsyncTcpStream,
-        command: &str,
-        args: &[String],
-    ) -> Result<()> {
-        let msg = ClientMessage::Request {
-            session_id: self.session_id.clone(),
-            command: command.to_string(),
-            args: args.to_vec(),
-            arch: self.arch.clone(),
-            os: self.os.clone(),
-        };
-
-        let json = serde_json::to_string(&msg)?;
-        stream.write_all(json.as_bytes()).await?;
-        stream.write_all(b"\n").await?;
-        stream.flush().await?;
-        Ok(())
     }
 
     async fn send_handshake_to_writer(
@@ -146,13 +125,14 @@ impl ServerHandler {
         Ok(())
     }
 
-    async fn read_response<R: AsyncRead + Unpin>(
+    async fn read_message<R: AsyncRead + Unpin>(
         &self,
         reader: &mut BufReader<R>,
+        wait: Duration,
     ) -> Result<ServerMessage> {
         let mut line = String::new();
 
-        let n = timeout(Duration::from_secs(30), reader.read_line(&mut line))
+        let n = timeout(wait, reader.read_line(&mut line))
             .await
             .map_err(|_| ProtocolError::ConnectionClosed)??;
         if n == 0 {
@@ -160,6 +140,12 @@ impl ServerHandler {
         }
 
         let msg: ServerMessage = serde_json::from_str(line.trim())?;
+        if msg.session_id() != self.session_id {
+            return Err(ProtocolError::SessionMismatch {
+                expected: self.session_id.clone(),
+                actual: msg.session_id().to_string(),
+            });
+        }
         Ok(msg)
     }
 
@@ -169,38 +155,24 @@ impl ServerHandler {
         expected_hash: &str,
         expected_size: u64,
     ) -> Result<PathBuf> {
-        let mut temp_file = NamedTempFile::new()?;
+        let mut temp_file = NamedTempFile::with_prefix("beam-")?;
         let temp_path = temp_file.path().to_path_buf();
         let mut hasher = blake3::Hasher::new();
         let mut received = 0u64;
-        let mut line = String::new();
 
         loop {
-            line.clear();
-            let n = timeout(Duration::from_secs(30), reader.read_line(&mut line))
-                .await
-                .map_err(|_| ProtocolError::ConnectionClosed)??;
-            if n == 0 {
-                return Err(ProtocolError::ConnectionClosed);
-            }
-
-            let msg: ServerMessage = serde_json::from_str(line.trim())?;
-
-            match msg {
+            match self.read_message(reader, Duration::from_secs(30)).await? {
                 ServerMessage::BinaryChunk {
-                    session_id,
                     offset,
                     data,
                     is_final,
+                    ..
                 } => {
-                    if session_id != self.session_id {
-                        return Err(ProtocolError::SessionMismatch {
-                            expected: self.session_id.clone(),
-                            actual: session_id,
-                        });
-                    }
-
                     if offset != received {
+                        return Err(ProtocolError::InvalidFormat);
+                    }
+                    if received + data.len() as u64 > expected_size {
+                        // More bytes than advertised: refuse before writing them.
                         return Err(ProtocolError::InvalidFormat);
                     }
 
@@ -214,16 +186,11 @@ impl ServerHandler {
                         break;
                     }
                 }
-                ServerMessage::Error { message: _, .. } => {
-                    return Err(ProtocolError::InvalidFormat);
-                }
-                _ => {
-                    return Err(ProtocolError::InvalidFormat);
-                }
+                _ => return Err(ProtocolError::InvalidFormat),
             }
         }
 
-        // Verify hash
+        // Verify hash (the temp file is deleted on drop if this fails)
         let actual_hash = hasher.finalize().to_hex().to_string();
         if actual_hash != expected_hash {
             return Err(ProtocolError::Blake3Mismatch {
@@ -242,18 +209,27 @@ impl ServerHandler {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o755);
+            perms.set_mode(0o700);
         }
         std::fs::set_permissions(&temp_path, perms)?;
 
-        // Keep the temp file
+        // Keep the temp file; the caller removes it after running it. The
+        // write handle is closed here so exec does not fail with ETXTBSY.
         temp_file.disable_cleanup(true);
         Ok(temp_path)
     }
 
-    async fn execute_binary(&self, path: &Path, args: &[String]) -> Result<i32> {
+    fn execute_binary(&self, path: &Path, command: &str, args: &[String]) -> Result<i32> {
         let mut cmd = Command::new(path);
         cmd.args(args);
+        #[cfg(unix)]
+        {
+            // argv[0] is the name the user typed, as if it were installed.
+            use std::os::unix::process::CommandExt;
+            cmd.arg0(command);
+        }
+        #[cfg(not(unix))]
+        let _ = command;
 
         // Preserve stdin, stdout, stderr
         cmd.stdin(std::process::Stdio::inherit());
@@ -261,7 +237,17 @@ impl ServerHandler {
         cmd.stderr(std::process::Stdio::inherit());
 
         let status = cmd.status()?;
-        Ok(status.code().unwrap_or(-1))
+        if let Some(code) = status.code() {
+            return Ok(code);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(sig) = status.signal() {
+                return Ok(128 + sig);
+            }
+        }
+        Ok(1)
     }
 
     pub async fn handle_command(&self, command: &str, args: &[String]) -> Result<i32> {
@@ -277,10 +263,11 @@ impl ServerHandler {
         self.send_request_to_writer(&mut writer, command, args)
             .await?;
 
-        // Use the reader for all reads
-        let response = self.read_response(&mut reader).await?;
+        let response = self
+            .read_message(&mut reader, Duration::from_secs(30))
+            .await?;
 
-        match response {
+        let (size, hash) = match response {
             ServerMessage::Response {
                 exists,
                 compatible,
@@ -290,45 +277,75 @@ impl ServerHandler {
                 ..
             } => {
                 if !exists {
-                    eprintln!("beam: command '{}' not found on client", command);
+                    eprintln!("beam: {command}: command not found here or on the client");
                     if let Some(err) = error {
-                        eprintln!("beam: {}", err);
+                        eprintln!("beam: {err}");
                     }
-                    return Ok(127); // command not found
+                    return Ok(EXIT_NOT_FOUND);
                 }
 
                 if !compatible {
                     eprintln!(
-                        "beam: binary architecture/OS mismatch (client: {}/{}, server: {}/{})",
-                        self.arch,
-                        self.os,
-                        blake3_hash.unwrap_or_default(),
-                        ""
+                        "beam: {command}: the client's binary does not match this server ({}/{})",
+                        self.arch, self.os
                     );
-                    return Ok(126); // command found but not executable
+                    return Ok(EXIT_CANNOT_RUN);
                 }
 
-                let size = size.ok_or(ProtocolError::InvalidFormat)?;
-                let hash = blake3_hash.ok_or(ProtocolError::InvalidFormat)?;
-
-                // Prompt user for approval (via client)
-                // The client will prompt and send Approve message
-                // We wait for the binary stream
-
-                let binary_path = self.handle_binary_stream(&mut reader, &hash, size).await?;
-                let exit_code = self.execute_binary(&binary_path, args).await?;
-
-                // Cleanup temp file
-                let _ = std::fs::remove_file(&binary_path);
-
-                Ok(exit_code)
+                (
+                    size.ok_or(ProtocolError::InvalidFormat)?,
+                    blake3_hash.ok_or(ProtocolError::InvalidFormat)?,
+                )
             }
             ServerMessage::Error { message, .. } => {
-                eprintln!("beam: server error: {}", message);
-                Ok(1)
+                eprintln!("beam: client error: {message}");
+                return Ok(EXIT_NOT_FOUND);
             }
-            _ => Err(ProtocolError::InvalidFormat),
+            _ => return Err(ProtocolError::InvalidFormat),
+        };
+
+        // The client is now asking the user. Wait for the decision.
+        eprintln!("beam: {command}: not installed here, waiting for approval on the client...");
+        match self.read_message(&mut reader, APPROVAL_WAIT).await? {
+            ServerMessage::Approval { approved: true, .. } => {}
+            ServerMessage::Approval {
+                approved: false,
+                reason,
+                ..
+            } => {
+                let why = reason.unwrap_or_else(|| "denied on the client".to_string());
+                eprintln!("beam: {command}: not run ({why})");
+                return Ok(EXIT_NOT_FOUND);
+            }
+            ServerMessage::Error { message, .. } => {
+                eprintln!("beam: {command}: not run (client error: {message})");
+                return Ok(EXIT_NOT_FOUND);
+            }
+            _ => return Err(ProtocolError::InvalidFormat),
         }
+
+        let binary_path = match self.handle_binary_stream(&mut reader, &hash, size).await {
+            Ok(p) => p,
+            Err(ProtocolError::Blake3Mismatch { expected, actual }) => {
+                eprintln!(
+                    "beam: {command}: integrity check failed, not running it \
+                     (BLAKE3 expected {}…, got {}…)",
+                    &expected[..16.min(expected.len())],
+                    &actual[..16.min(actual.len())]
+                );
+                return Ok(EXIT_CANNOT_RUN);
+            }
+            Err(e) => return Err(e),
+        };
+        drop(reader);
+        drop(writer);
+
+        let result = self.execute_binary(&binary_path, command, args);
+
+        // Cleanup temp file
+        let _ = std::fs::remove_file(&binary_path);
+
+        result
     }
 
     fn install_shell_integration(shell: &str, system: bool) -> String {
@@ -349,10 +366,9 @@ impl ServerHandler {
         };
 
         match shell {
-            "bash" | "zsh" => format!(
-                r#"
+            "bash" | "zsh" => r#"
 # Beam command-not-found handler
-beam_command_not_found_handle() {{
+beam_command_not_found_handle() {
     local cmd="$1"
     shift
     if command -v beam-server-handler >/dev/null 2>&1; then
@@ -360,23 +376,23 @@ beam_command_not_found_handle() {{
         return $?
     fi
     return 127
-}}
+}
 
 # Bash
 if [ -n "$BASH_VERSION" ]; then
-    command_not_found_handle() {{
+    command_not_found_handle() {
         beam_command_not_found_handle "$@"
-    }}
+    }
 fi
 
 # Zsh
 if [ -n "$ZSH_VERSION" ]; then
-    command_not_found_handler() {{
+    command_not_found_handler() {
         beam_command_not_found_handle "$@"
-    }}
+    }
 fi
 "#
-            ),
+            .to_string(),
             "fish" => r#"
 # Beam command-not-found handler for fish
 function fish_command_not_found --on-event fish_command_not_found
@@ -400,9 +416,21 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Handle { command, args } => {
+            let handler = match ServerHandler::from_env() {
+                Ok(h) => h,
+                Err(why) => {
+                    eprintln!("beam: {command}: command not found ({why})");
+                    std::process::exit(EXIT_NOT_FOUND);
+                }
+            };
             let rt = tokio::runtime::Runtime::new()?;
-            let handler = ServerHandler::new()?;
-            let exit_code = rt.block_on(handler.handle_command(&command, &args))?;
+            let exit_code = match rt.block_on(handler.handle_command(&command, &args)) {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("beam: {command}: command not found (beam: {e})");
+                    EXIT_NOT_FOUND
+                }
+            };
             std::process::exit(exit_code);
         }
         Commands::Install { shell, system } => {

@@ -158,10 +158,16 @@ async fn test_binary_streaming() {
         std::io::Write::write_all(&mut reader.get_mut(), b"\n").unwrap();
         std::io::Write::flush(&mut reader.get_mut()).unwrap();
 
-        // Read approve
-        line.clear();
-        std::io::BufRead::read_line(&mut reader, &mut line).unwrap();
-        let _msg: ClientMessage = serde_json::from_str(line.trim()).unwrap();
+        // The user approved on the client: tell the handler before streaming
+        let approval = ServerMessage::Approval {
+            session_id: session_id_for_server.clone(),
+            approved: true,
+            reason: None,
+        };
+        let json = serde_json::to_string(&approval).unwrap();
+        std::io::Write::write_all(&mut reader.get_mut(), json.as_bytes()).unwrap();
+        std::io::Write::write_all(&mut reader.get_mut(), b"\n").unwrap();
+        std::io::Write::flush(&mut reader.get_mut()).unwrap();
 
         // Stream binary
         let mut file = std::fs::File::open(&binary_path_for_server).unwrap();
@@ -250,15 +256,13 @@ async fn test_binary_streaming() {
     assert_eq!(hash, expected_hash);
     assert_eq!(size, expected_size);
 
-    // Send approve
-    let msg = ClientMessage::Approve {
-        session_id: session_id.clone(),
-        approved: true,
-    };
-    let json = serde_json::to_string(&msg).unwrap();
-    reader.get_mut().write_all(json.as_bytes()).await.unwrap();
-    reader.get_mut().write_all(b"\n").await.unwrap();
-    reader.get_mut().flush().await.unwrap();
+    // Approval arrives before any binary chunk
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    match serde_json::from_str::<ServerMessage>(line.trim()).unwrap() {
+        ServerMessage::Approval { approved, .. } => assert!(approved),
+        other => panic!("Expected Approval, got {other:?}"),
+    }
 
     // Read binary chunks
     let mut received = Vec::new();
