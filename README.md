@@ -68,7 +68,8 @@ eval "$(beam-server-handler shell-init --shell bash)"
 |---|---|
 | Ran | the program's own |
 | Denied, timed out, or not on your machine either | 127 |
-| Hash mismatch or wrong architecture | 126 (nothing runs) |
+| Beam versions differ on the two ends | 127 (with a message saying so) |
+| Size or hash mismatch, malformed stream, or wrong architecture | 126 (nothing runs) |
 
 ## Security
 
@@ -94,7 +95,7 @@ eval "$(beam-server-handler shell-init --shell bash)"
 
 - **Same OS and architecture** on both ends. No emulation or cross-compiling.
 - **One file only.** Shared libraries and interpreters aren't sent, so dynamically linked tools need their libraries on the server.
-- **Slow for big binaries.** Chunks are sent as JSON arrays, about 3–4× the file's size on the wire.
+- **Both ends need the same Beam version.** Protocol 2.0 doesn't talk to 1.x; a mismatch is refused with a message on both sides.
 - **No caching.** Every run streams the binary again, and approvals aren't remembered.
 - **fish** works, but the exit code is always 127 (fish forces it after its not-found handler). Not covered by tests.
 - **ControlMaster** should work but isn't tested. With `ControlPersist`, a finished session's forward lingers until the master exits.
@@ -114,22 +115,24 @@ cargo clippy --workspace --all-targets -- -D warnings
 BEAM_E2E_SSHD=1 cargo test -p beam-tests -- --nocapture
 ```
 
-The end-to-end test starts its own throwaway `sshd`, drives the real wrapper and hook in a pseudo-terminal, and types the answers. It covers approve, deny, timeout, a binary swapped mid-prompt, a command missing on both ends, and zsh on both sides. CI runs all of it on every push.
+The end-to-end test starts its own throwaway `sshd`, drives the real wrapper and hook in a pseudo-terminal, and types the answers. It covers approve, deny, timeout, a binary swapped mid-prompt, a command missing on both ends, a 4 MiB binary, and zsh on both sides. A second test (`tests/tests/loopback.rs`, part of `cargo test`) runs the real binaries over plain TCP and checks that a 5 MiB binary costs about 1× its size on the wire, that a bigger file swapped in mid-prompt is refused with 126, and the version-mismatch messages. CI runs all of it on every push.
 
 The workspace is three crates: `beam-client`, `beam-server-handler` and `beam-common` (the protocol).
 
 <details>
-<summary>Protocol (v1.1)</summary>
+<summary>Protocol (v2.0)</summary>
 
-JSON Lines over the tunnelled TCP connection. The server handler speaks first.
+One TCP connection through the tunnel. The server handler speaks first. Control messages are JSON Lines; the binary itself is raw frames.
 
-1. **Handshake:** magic bytes `BEAM\0` plus a length-prefixed protocol version.
+1. **Handshake** (server → client): magic bytes `BEAM\0`, then the protocol version as one length byte plus text (`2.0`). On a mismatch `beam-client` says so on its terminal and replies with an `error` message naming both versions; a handler whose client hangs up during the handshake reports that the client probably runs an older Beam.
 2. **Request** (server → client): `{"type":"request","session_id":"…","command":"foo","args":[],"arch":"x86_64","os":"linux"}`
 3. **Response** (client → server): `{"type":"response","session_id":"…","exists":true,"compatible":true,"size":12345,"blake3_hash":"…","error":null}`
 4. **Approval** (client → server): `{"type":"approval","session_id":"…","approved":true,"reason":null}`. If not approved, `reason` says why and nothing follows.
-5. **Binary chunks** (client → server): `{"type":"binary_chunk","session_id":"…","offset":0,"data":[…],"is_final":false}`, ending with `"is_final":true`. The server verifies size and hash before running anything.
+5. **Binary** (client → server, only after an approved `approval`): raw frames, each a `u32` big-endian length followed by that many bytes, at most 64 KiB per frame. A zero-length frame ends the stream. The server refuses a frame over 64 KiB or any byte past the approved size, then checks the total size and BLAKE3 hash before running anything. Overhead is 4 bytes per 64 KiB, so the wire size is about 1× the file.
 
-The Rust type names are historical: `ClientMessage` is what the handler sends, `ServerMessage` is what `beam-client` sends.
+Any step can be answered with `{"type":"error","session_id":"…","message":"…"}`, which the handler prints. The Rust type names are historical: `ClientMessage` is what the handler sends, `ServerMessage` is what `beam-client` sends.
+
+1.x sent the binary as JSON `binary_chunk` messages with the bytes as an array of numbers, about 3–3.5× the file's size.
 
 </details>
 
