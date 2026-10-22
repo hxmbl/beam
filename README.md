@@ -23,17 +23,38 @@ Nothing is installed on the server, no daemon runs anywhere, and nothing is sent
 
 ## Install
 
-Build from source (Rust 1.88+):
+Download a prebuilt release from the [Releases page](https://github.com/hxmbl/beam/releases). Each archive is named `beam-<version>-<target>.tar.gz` and holds both binaries (`beam-client`, `beam-server-handler`) plus `LICENSE` and `README.md`. `SHA256SUMS` lists the checksums.
+
+| Target | Platform |
+| --- | --- |
+| `x86_64-unknown-linux-musl` | Linux x86_64 (static) |
+| `aarch64-unknown-linux-musl` | Linux arm64 (static) |
+| `x86_64-apple-darwin` | macOS Intel |
+| `aarch64-apple-darwin` | macOS Apple silicon |
+
+The Linux builds are statically linked, so `beam-server-handler` can be copied onto any Linux host of that architecture.
+
+```bash
+v=0.1.0 t=x86_64-unknown-linux-musl
+curl -LO https://github.com/hxmbl/beam/releases/download/v$v/beam-$v-$t.tar.gz
+curl -LO https://github.com/hxmbl/beam/releases/download/v$v/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS      # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS
+tar -xzf beam-$v-$t.tar.gz                         # -> beam-$v-$t/beam-client, beam-$v-$t/beam-server-handler
+```
+
+Or build from source (Rust 1.88+); the binaries land in `target/release/`:
 
 ```bash
 git clone https://github.com/hxmbl/beam && cd beam
 cargo build --release
 ```
 
+Both ends need the same Beam version.
+
 ### On your machine (the one you ssh from)
 
 ```bash
-cp target/release/beam-client ~/.local/bin/          # anywhere on PATH
+cp beam-client ~/.local/bin/                         # anywhere on PATH
 
 # ~/.bashrc
 eval "$(beam-client shell-init --shell bash)"

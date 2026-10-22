@@ -1,0 +1,134 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: tag matches crate version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - id: check
+        name: compare tag with Cargo.toml versions
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          meta="$(cargo metadata --no-deps --format-version 1 --locked)"
+          for crate in beam-client beam-server-handler; do
+            v="$(jq -r --arg n "$crate" '.packages[] | select(.name == $n) | .version' <<<"$meta")"
+            if [ "$v" != "$version" ]; then
+              echo "::error::tag $tag does not match $crate version $v"
+              exit 1
+            fi
+            echo "$crate $v matches $tag"
+          done
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: [version, ci]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - target: aarch64-apple-darwin
+            os: macos-14
+            zig: false
+          - target: x86_64-apple-darwin
+            os: macos-14
+            zig: false
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.version.outputs.version }}
+      CARGO_PROFILE_RELEASE_STRIP: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        if: matrix.zig
+        with:
+          python-version: "3.12"
+      - name: install cargo-zigbuild
+        if: matrix.zig
+        run: pip install cargo-zigbuild==0.24.0 ziglang==0.17.0
+      - name: build (static musl, cargo-zigbuild)
+        if: matrix.zig
+        run: cargo zigbuild --release --locked -p beam-client -p beam-server-handler --target "$TARGET"
+      - name: build (cargo)
+        if: ${{ !matrix.zig }}
+        run: cargo build --release --locked -p beam-client -p beam-server-handler --target "$TARGET"
+      - name: package
+        shell: bash
+        run: |
+          name="beam-${VERSION}-${TARGET}"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/beam-client" "target/$TARGET/release/beam-server-handler" \
+             LICENSE README.md "dist/$name/"
+          file "dist/$name/beam-client" "dist/$name/beam-server-handler"
+          COPYFILE_DISABLE=1 tar -C dist -czf "dist/$name.tar.gz" "$name"
+          tar -tzvf "dist/$name.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: beam-${{ matrix.target }}
+          path: dist/beam-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      # actions/checkout turns annotated tags into lightweight ones; refetch so the tag message survives.
+      - name: fetch tag object
+        run: git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: beam-*
+          path: dist
+          merge-multiple: true
+      - name: SHA256SUMS
+        working-directory: dist
+        run: |
+          ls -l
+          test "$(ls beam-*.tar.gz | wc -l)" -eq 4
+          sha256sum beam-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: create release
+        run: |
+          if [ "$(git cat-file -t "$TAG")" = tag ]; then
+            notes=(--notes-from-tag)
+          else
+            notes=(--generate-notes)
+          fi
+          gh release create "$TAG" dist/beam-*.tar.gz dist/SHA256SUMS \
+            --verify-tag --title "Beam $TAG" --latest "${notes[@]}"
