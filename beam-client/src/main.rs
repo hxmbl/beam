@@ -1,6 +1,6 @@
 use beam_common::{
-    ClientMessage, MAGIC_BYTES, PROTOCOL_VERSION, ProtocolError, Result, ServerMessage,
-    compute_blake3_file,
+    ClientMessage, PROTOCOL_VERSION, ProtocolError, Result, ServerMessage, compute_blake3_file,
+    frame, read_handshake, version_mismatch_message,
 };
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -9,7 +9,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -231,8 +231,10 @@ impl BeamClient {
                         match Self::handle_connection(stream, binary_cache, config, session_id)
                             .await
                         {
-                            // Already reported by stream_binary in plain words.
-                            Ok(()) | Err(ProtocolError::Blake3Mismatch { .. }) => {}
+                            // Already reported in plain words.
+                            Ok(())
+                            | Err(ProtocolError::Blake3Mismatch { .. })
+                            | Err(ProtocolError::VersionMismatch { .. }) => {}
                             Err(e) => eprintln!("beam: connection error from {}: {}", addr, e),
                         }
                     });
@@ -251,27 +253,16 @@ impl BeamClient {
         config: ClientConfig,
         expected_session_id: String,
     ) -> Result<()> {
-        // Read magic bytes
-        let mut magic = [0u8; 5];
-        stream.read_exact(&mut magic).await?;
-        if magic != MAGIC_BYTES {
-            return Err(ProtocolError::InvalidFormat);
-        }
-
-        // Read protocol version
-        let mut version_len = [0u8; 1];
-        stream.read_exact(&mut version_len).await?;
-        let mut version_buf = vec![0u8; version_len[0] as usize];
-        stream.read_exact(&mut version_buf).await?;
-        let version = String::from_utf8(version_buf).map_err(|_| ProtocolError::InvalidFormat)?;
-        if version != PROTOCOL_VERSION {
-            return Err(ProtocolError::InvalidFormat);
-        }
+        let version = read_handshake(&mut stream).await?;
 
         // Read messages line by line (JSON Lines)
         let (rd, mut wr) = stream.into_split();
         let mut reader = BufReader::new(rd);
         let mut line = String::new();
+
+        if version != PROTOCOL_VERSION {
+            return Self::refuse_version(&mut reader, &mut wr, &version).await;
+        }
 
         while reader.read_line(&mut line).await? > 0 {
             let trimmed = line.trim();
@@ -325,6 +316,35 @@ impl BeamClient {
         }
 
         Ok(())
+    }
+
+    /// The handler speaks another protocol version. Say so here, and tell the
+    /// handler in an `error` message: its first JSON line carries the session
+    /// id it expects, and every Beam version so far prints a client `error`.
+    async fn refuse_version(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        wr: &mut tokio::net::tcp::OwnedWriteHalf,
+        theirs: &str,
+    ) -> Result<()> {
+        let message = version_mismatch_message(PROTOCOL_VERSION, theirs);
+        eprintln!("\r\nbeam: refused a request from the server's beam-server-handler: {message}\r");
+        let mut line = String::new();
+        let wait = std::time::Duration::from_secs(5);
+        if let Ok(Ok(n)) = tokio::time::timeout(wait, reader.read_line(&mut line)).await
+            && n > 0
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim())
+            && let Some(session_id) = v.get("session_id").and_then(|s| s.as_str())
+        {
+            let err = ServerMessage::Error {
+                session_id: session_id.to_string(),
+                message: message.clone(),
+            };
+            let _ = Self::send_message(wr, &err).await;
+        }
+        Err(ProtocolError::VersionMismatch {
+            ours: PROTOCOL_VERSION.to_string(),
+            theirs: theirs.to_string(),
+        })
     }
 
     async fn handle_request(
@@ -387,7 +407,7 @@ impl BeamClient {
         Self::send_message(wr, &approval).await?;
 
         if decision.approved() {
-            Self::stream_binary(wr, &session_id, &meta).await?;
+            Self::stream_binary(wr, &meta).await?;
         }
 
         Ok(())
@@ -415,48 +435,16 @@ impl BeamClient {
         )
     }
 
-    /// Stream the file the user approved. The server checks the stream against
-    /// the size and hash it was shown, so if the file changed since then the
-    /// server refuses to run it; we warn about it here as well.
+    /// Stream the file the user approved as raw frames. The server checks the
+    /// stream against the size and hash it was shown, so if the file changed
+    /// since then the server refuses to run it; we warn about it here as well.
     async fn stream_binary(
         wr: &mut (impl AsyncWriteExt + Unpin),
-        session_id: &str,
         meta: &BinaryMetadata,
     ) -> Result<()> {
         let mut file = tokio::fs::File::open(&meta.path).await?;
-        let mut buffer = vec![0u8; 64 * 1024]; // 64KB chunks
-        let mut offset = 0u64;
-        let mut hasher = blake3::Hasher::new();
+        let (sent_hash, _sent) = frame::send_binary(&mut file, wr).await?;
 
-        loop {
-            let n = file.read(&mut buffer).await?;
-            if n == 0 {
-                break;
-            }
-
-            let chunk = &buffer[..n];
-            hasher.update(chunk);
-
-            let msg = ServerMessage::BinaryChunk {
-                session_id: session_id.to_string(),
-                offset,
-                data: chunk.to_vec(),
-                is_final: false,
-            };
-
-            Self::send_message(wr, &msg).await?;
-            offset += n as u64;
-        }
-
-        let msg = ServerMessage::BinaryChunk {
-            session_id: session_id.to_string(),
-            offset,
-            data: vec![],
-            is_final: true,
-        };
-        Self::send_message(wr, &msg).await?;
-
-        let sent_hash = hasher.finalize().to_hex().to_string();
         if sent_hash != meta.blake3_hash {
             eprintln!(
                 "beam: warning: {} changed after it was approved; the server will refuse it",

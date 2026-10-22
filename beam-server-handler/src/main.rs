@@ -1,8 +1,9 @@
+use beam_common::frame::{self, MAX_FRAME_SIZE};
 use beam_common::{
-    ClientMessage, MAGIC_BYTES, PROTOCOL_VERSION, ProtocolError, Result, ServerMessage,
+    ClientMessage, PROTOCOL_VERSION, ProtocolError, Result, ServerMessage, write_handshake,
 };
 use clap::{Parser, Subcommand};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -20,6 +21,8 @@ const EXIT_CANNOT_RUN: i32 = 126;
 /// Longest we wait for the user to answer on the client. The client denies on
 /// its own after its prompt timeout (30s by default), so this is only a backstop.
 const APPROVAL_WAIT: Duration = Duration::from_secs(300);
+/// Longest we wait for any single binary frame.
+const FRAME_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Parser)]
 #[command(
@@ -100,18 +103,6 @@ impl ServerHandler {
         Ok(stream)
     }
 
-    async fn send_handshake_to_writer(
-        &self,
-        writer: &mut tokio::io::WriteHalf<AsyncTcpStream>,
-    ) -> Result<()> {
-        writer.write_all(MAGIC_BYTES).await?;
-        let version_bytes = PROTOCOL_VERSION.as_bytes();
-        writer.write_all(&[version_bytes.len() as u8]).await?;
-        writer.write_all(version_bytes).await?;
-        writer.flush().await?;
-        Ok(())
-    }
-
     async fn send_request_to_writer(
         &self,
         writer: &mut tokio::io::WriteHalf<AsyncTcpStream>,
@@ -157,60 +148,21 @@ impl ServerHandler {
         Ok(msg)
     }
 
+    /// Receive the approved binary as raw frames into a temp file. Size and
+    /// BLAKE3 are checked against what the user approved before this returns.
     async fn handle_binary_stream<R: AsyncRead + Unpin>(
         &self,
         reader: &mut BufReader<R>,
         expected_hash: &str,
         expected_size: u64,
     ) -> Result<PathBuf> {
-        let mut temp_file = NamedTempFile::with_prefix("beam-")?;
+        let temp_file = NamedTempFile::with_prefix("beam-")?;
         let temp_path = temp_file.path().to_path_buf();
-        let mut hasher = blake3::Hasher::new();
-        let mut received = 0u64;
 
-        loop {
-            match self.read_message(reader, Duration::from_secs(30)).await? {
-                ServerMessage::BinaryChunk {
-                    offset,
-                    data,
-                    is_final,
-                    ..
-                } => {
-                    if offset != received {
-                        return Err(ProtocolError::InvalidFormat);
-                    }
-                    if received + data.len() as u64 > expected_size {
-                        // More bytes than advertised: refuse before writing them.
-                        return Err(ProtocolError::InvalidFormat);
-                    }
-
-                    if !data.is_empty() {
-                        hasher.update(&data);
-                        temp_file.write_all(&data)?;
-                        received += data.len() as u64;
-                    }
-
-                    if is_final {
-                        break;
-                    }
-                }
-                _ => return Err(ProtocolError::InvalidFormat),
-            }
-        }
-
-        // Verify hash (the temp file is deleted on drop if this fails)
-        let actual_hash = hasher.finalize().to_hex().to_string();
-        if actual_hash != expected_hash {
-            return Err(ProtocolError::Blake3Mismatch {
-                expected: expected_hash.to_string(),
-                actual: actual_hash,
-            });
-        }
-
-        // Verify size
-        if received != expected_size {
-            return Err(ProtocolError::InvalidFormat);
-        }
+        // The temp file is deleted on drop if anything below fails.
+        let mut sink = BufWriter::new(temp_file);
+        frame::receive_binary(reader, &mut sink, expected_size, expected_hash, FRAME_WAIT).await?;
+        let mut temp_file = sink.into_inner().map_err(|e| e.into_error())?;
 
         // Make executable
         let mut perms = std::fs::metadata(&temp_path)?.permissions();
@@ -266,14 +218,28 @@ impl ServerHandler {
         let mut reader = BufReader::new(reader_half);
         let mut writer = writer_half;
 
-        // Write handshake and request directly to writer
-        self.send_handshake_to_writer(&mut writer).await?;
-        self.send_request_to_writer(&mut writer, command, args)
-            .await?;
-
-        let response = self
-            .read_message(&mut reader, Duration::from_secs(30))
-            .await?;
+        // Handshake, request, first answer. A 1.x beam-client reads our
+        // version, gives up and hangs up without a word, which shows up here
+        // as a closed or reset connection: say what most likely happened.
+        let first = async {
+            write_handshake(&mut writer).await?;
+            self.send_request_to_writer(&mut writer, command, args)
+                .await?;
+            self.read_message(&mut reader, Duration::from_secs(30))
+                .await
+        };
+        let response = match first.await {
+            Ok(r) => r,
+            Err(e) if hung_up(&e) => {
+                eprintln!(
+                    "beam: {command}: not run: beam-client closed the connection during the \
+                     handshake. It probably runs an older Beam protocol (this server speaks \
+                     {PROTOCOL_VERSION}); install the same Beam version on both ends."
+                );
+                return Ok(EXIT_NOT_FOUND);
+            }
+            Err(e) => return Err(e),
+        };
 
         let (size, hash) = match response {
             ServerMessage::Response {
@@ -302,7 +268,7 @@ impl ServerHandler {
                 )
             }
             ServerMessage::Error { message, .. } => {
-                eprintln!("beam: client error: {message}");
+                eprintln!("beam: {command}: not run (client error: {message})");
                 return Ok(EXIT_NOT_FOUND);
             }
             _ => return Err(ProtocolError::InvalidFormat),
@@ -339,6 +305,20 @@ impl ServerHandler {
                 );
                 return Ok(EXIT_CANNOT_RUN);
             }
+            Err(ProtocolError::SizeMismatch { expected, actual }) => {
+                eprintln!(
+                    "beam: {command}: integrity check failed, not running it \
+                     (expected {expected} bytes, got {actual})"
+                );
+                return Ok(EXIT_CANNOT_RUN);
+            }
+            Err(ProtocolError::FrameTooLarge { len, .. }) => {
+                eprintln!(
+                    "beam: {command}: bad binary stream from the client, not running it \
+                     ({len}-byte frame, limit {MAX_FRAME_SIZE})"
+                );
+                return Ok(EXIT_CANNOT_RUN);
+            }
             Err(e) => return Err(e),
         };
         drop(reader);
@@ -350,6 +330,19 @@ impl ServerHandler {
         let _ = std::fs::remove_file(&binary_path);
 
         result
+    }
+}
+
+/// The peer closed or reset the connection.
+fn hung_up(e: &ProtocolError) -> bool {
+    use std::io::ErrorKind::*;
+    match e {
+        ProtocolError::ConnectionClosed => true,
+        ProtocolError::Io(io) => matches!(
+            io.kind(),
+            BrokenPipe | ConnectionReset | ConnectionAborted | UnexpectedEof
+        ),
+        _ => false,
     }
 }
 
@@ -418,11 +411,7 @@ fn main() -> Result<()> {
                     .await
                     .map_err(|_| ProtocolError::ConnectionClosed)??;
 
-                stream.write_all(MAGIC_BYTES).await?;
-                let version_bytes = PROTOCOL_VERSION.as_bytes();
-                stream.write_all(&[version_bytes.len() as u8]).await?;
-                stream.write_all(version_bytes).await?;
-                stream.flush().await?;
+                write_handshake(&mut stream).await?;
 
                 let msg = ClientMessage::Ping { session_id };
                 let json = serde_json::to_string(&msg)?;
@@ -440,6 +429,10 @@ fn main() -> Result<()> {
                 match response {
                     ServerMessage::Pong { session_id } => {
                         println!("Connection successful: session {}", session_id);
+                    }
+                    ServerMessage::Error { message, .. } => {
+                        eprintln!("beam: {message}");
+                        std::process::exit(1);
                     }
                     _ => {
                         eprintln!("Unexpected response");

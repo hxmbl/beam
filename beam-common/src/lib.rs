@@ -29,20 +29,14 @@ pub enum ServerMessage {
         error: Option<String>,
     },
     /// The user's decision on the client, sent after a `Response` with
-    /// `exists && compatible`. Binary chunks follow only when `approved` is true.
+    /// `exists && compatible`. When `approved` is true the binary follows as
+    /// raw length-prefixed frames (see [`frame`]), not as JSON.
     #[serde(rename = "approval")]
     Approval {
         session_id: String,
         approved: bool,
         /// Why the request was denied (user said no, prompt timed out, no TTY).
         reason: Option<String>,
-    },
-    #[serde(rename = "binary_chunk")]
-    BinaryChunk {
-        session_id: String,
-        offset: u64,
-        data: Vec<u8>,
-        is_final: bool,
     },
     #[serde(rename = "error")]
     Error { session_id: String, message: String },
@@ -64,7 +58,6 @@ impl ServerMessage {
         match self {
             ServerMessage::Response { session_id, .. } => session_id,
             ServerMessage::Approval { session_id, .. } => session_id,
-            ServerMessage::BinaryChunk { session_id, .. } => session_id,
             ServerMessage::Error { session_id, .. } => session_id,
             ServerMessage::Pong { session_id } => session_id,
         }
@@ -85,13 +78,62 @@ pub enum ProtocolError {
     ConnectionClosed,
     #[error("BLAKE3 verification failed: expected {expected}, got {actual}")]
     Blake3Mismatch { expected: String, actual: String },
+    #[error("size mismatch: expected {expected} bytes, got {actual}")]
+    SizeMismatch { expected: u64, actual: u64 },
+    #[error("binary frame of {len} bytes is over the {max}-byte limit")]
+    FrameTooLarge { len: u32, max: u32 },
+    #[error(
+        "protocol version mismatch: this side speaks {ours}, the other side speaks {theirs}; \
+         install the same Beam version on both ends"
+    )]
+    VersionMismatch { ours: String, theirs: String },
 }
 
 pub type Result<T> = std::result::Result<T, ProtocolError>;
 
 /// 1.1: adds the `approval` message between `response` and the binary stream.
-pub const PROTOCOL_VERSION: &str = "1.1";
+/// 2.0: the binary is sent as raw length-prefixed frames instead of JSON
+/// `binary_chunk` messages. Not compatible with 1.x.
+pub const PROTOCOL_VERSION: &str = "2.0";
 pub const MAGIC_BYTES: &[u8] = b"BEAM\0";
+
+/// Message for a peer whose handshake named another protocol version.
+pub fn version_mismatch_message(ours: &str, theirs: &str) -> String {
+    ProtocolError::VersionMismatch {
+        ours: ours.to_string(),
+        theirs: theirs.to_string(),
+    }
+    .to_string()
+}
+
+pub mod frame;
+
+/// Write the handshake: magic bytes, then our protocol version (u8 length + bytes).
+pub async fn write_handshake<W: tokio::io::AsyncWrite + Unpin>(w: &mut W) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    w.write_all(MAGIC_BYTES).await?;
+    let version = PROTOCOL_VERSION.as_bytes();
+    w.write_all(&[version.len() as u8]).await?;
+    w.write_all(version).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+/// Read a handshake and return the peer's protocol version. Fails on wrong
+/// magic bytes; the caller compares the version with [`PROTOCOL_VERSION`].
+pub async fn read_handshake<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut magic = [0u8; 5];
+    r.read_exact(&mut magic).await?;
+    if magic != MAGIC_BYTES {
+        return Err(ProtocolError::InvalidFormat);
+    }
+    let mut len = [0u8; 1];
+    r.read_exact(&mut len).await?;
+    let mut version = vec![0u8; len[0] as usize];
+    r.read_exact(&mut version).await?;
+    String::from_utf8(version).map_err(|_| ProtocolError::InvalidFormat)
+}
 
 pub fn compute_blake3(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
@@ -152,6 +194,32 @@ mod tests {
             error: None,
         };
         assert_eq!(msg.session_id(), "abc");
+    }
+
+    #[test]
+    fn test_version_is_2_and_mismatch_message_names_both() {
+        assert_eq!(PROTOCOL_VERSION, "2.0");
+        let m = version_mismatch_message("2.0", "1.1");
+        assert!(m.contains("2.0") && m.contains("1.1"), "{m}");
+        assert!(m.contains("same Beam version"), "{m}");
+    }
+
+    #[test]
+    fn test_binary_chunk_is_gone() {
+        let old =
+            r#"{"type":"binary_chunk","session_id":"s","offset":0,"data":[1,2],"is_final":true}"#;
+        assert!(serde_json::from_str::<ServerMessage>(old).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handshake_roundtrip() {
+        let mut wire = Vec::new();
+        write_handshake(&mut wire).await.unwrap();
+        assert!(wire.starts_with(MAGIC_BYTES));
+        assert_eq!(read_handshake(&mut wire.as_slice()).await.unwrap(), "2.0");
+        let mut bad = wire.clone();
+        bad[0] = b'X';
+        assert!(read_handshake(&mut bad.as_slice()).await.is_err());
     }
 
     #[test]
