@@ -35,7 +35,7 @@ Download a prebuilt release from the [Releases page](https://github.com/hxmbl/be
 The Linux builds are statically linked, so `beam-server-handler` can be copied onto any Linux host of that architecture.
 
 ```bash
-v=0.1.0 t=x86_64-unknown-linux-musl
+v=0.1.11 t=x86_64-unknown-linux-musl
 curl -LO https://github.com/hxmbl/beam/releases/download/v$v/beam-$v-$t.tar.gz
 curl -LO https://github.com/hxmbl/beam/releases/download/v$v/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS      # macOS: shasum -a 256 -c --ignore-missing SHA256SUMS

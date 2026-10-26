@@ -60,7 +60,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "beam-client"
-version = "0.1.1"
+version = "0.1.11"
 dependencies = [
  "beam-common",
  "blake3",
@@ -80,7 +80,7 @@ dependencies = [
 
 [[package]]
 name = "beam-common"
-version = "0.1.1"
+version = "0.1.11"
 dependencies = [
  "blake3",
  "serde",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "beam-server-handler"
-version = "0.1.1"
+version = "0.1.11"
 dependencies = [
  "beam-common",
  "blake3",
@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "beam-tests"
-version = "0.1.1"
+version = "0.1.11"
 dependencies = [
  "libc",
  "tempfile",
